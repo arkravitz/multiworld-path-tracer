@@ -1,0 +1,24 @@
+[package]
+name = "multiworld-path-tracer"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+description = "GPU playground for stochastic light transport across incompatible worlds"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+eframe = { version = "=0.36.2", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+glam = "0.30"
+png = "0.18"
+pollster = "0.4"
+wgpu = "30"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,19 @@
+# Generated builds, captures and experiment output
+/target/
+/output/
+/captures/
+/release/
+# Local source attachment; the public README documents the implemented experiment.
+/SPEC.md
+# OS/editor state and local credentials
+.DS_Store
+*.log
+*.swp
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+.aws/
+.codex/
+.agents/
