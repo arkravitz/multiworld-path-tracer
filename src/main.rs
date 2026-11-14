@@ -3,6 +3,7 @@ use clap::Parser;
 use multiworld_path_tracer::{
     app,
     gpu::{self, Renderer},
+    scene::WorldPreset,
     settings::{Mode, Settings},
 };
 use std::{path::PathBuf, time::Instant};
@@ -11,6 +12,9 @@ use std::{path::PathBuf, time::Instant};
 struct Args {
     #[arg(long)]
     headless: bool,
+    /// Use the original cosine-only estimator for comparison.
+    #[arg(long)]
+    no_light_sampling: bool,
     /// Use the linear intersection reference instead of the per-world BVHs.
     #[arg(long)]
     brute_force: bool,
@@ -25,6 +29,10 @@ struct Args {
     all_modes: bool,
     #[arg(long, value_enum, default_value = "per-bounce")]
     mode: Mode,
+    #[arg(long, value_enum, default_value = "sunken-temple")]
+    world_a: WorldPreset,
+    #[arg(long, value_enum, default_value = "bioluminescent-grove")]
+    world_b: WorldPreset,
     #[arg(long, default_value_t = 800)]
     width: u32,
     #[arg(long, default_value_t = 600)]
@@ -71,6 +79,8 @@ fn main() -> Result<()> {
     ensure!(args.exposure.is_finite(), "Exposure must be finite");
     let mut settings = Settings {
         mode: args.mode,
+        worlds: [args.world_a, args.world_b],
+        light_sampling: !args.no_light_sampling,
         use_bvh: !args.brute_force,
         adaptive_bvh: !args.force_bvh,
         denoise: args.denoise,
@@ -96,10 +106,11 @@ fn main() -> Result<()> {
     };
     std::fs::create_dir_all(&args.output)?;
     let mut report = format!(
-        "Multiworld GPU comparison\nBVH={}, adaptive={}, denoise={}\n{}x{}, {} spp (per world for blend), seed {}, depth {}\np={}, s={}, spatial={}, primary_a={}\nCamera: yaw={}, pitch={}, distance={}\nExposure={} EV\nGPU: {:?}\n",
+        "Multiworld GPU comparison\nBVH={}, adaptive={}, denoise={}, light_sampling={}\n{}x{}, {} spp (per world for blend), seed {}, depth {}\np={}, s={}, spatial={}, primary_a={}\nCamera: yaw={}, pitch={}, distance={}\nExposure={} EV\nGPU: {:?}\n",
         settings.use_bvh,
         settings.adaptive_bvh,
         settings.denoise,
+        settings.light_sampling,
         args.width,
         args.height,
         args.samples,
@@ -115,6 +126,11 @@ fn main() -> Result<()> {
         settings.exposure,
         renderer.device.adapter_info()
     );
+    report.push_str(&format!(
+        "World A: {}\nWorld B: {}\n",
+        settings.worlds[0].label(),
+        settings.worlds[1].label()
+    ));
     for mode in modes {
         settings.mode = mode;
         renderer.reset();

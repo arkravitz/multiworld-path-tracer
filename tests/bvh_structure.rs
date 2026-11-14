@@ -39,6 +39,8 @@ fn check(objects: &[Object], bvh: &Bvh) {
             let c = Vec3::from_slice(&o.center_radius[..3]);
             let e = if o.extent_shape[3] == 0. {
                 Vec3::splat(o.center_radius[3])
+            } else if o.extent_shape[3] == 3. {
+                Vec3::from_slice(&o.extent_shape[..3]).abs() + Vec3::splat(o.center_radius[3])
             } else {
                 Vec3::from_slice(&o.extent_shape[..3])
             };
@@ -98,9 +100,27 @@ fn invalid_geometry_is_rejected_before_upload() {
     bad.extent_shape = [-1., 1., 1., 1.];
     assert!(Bvh::build(&[bad]).is_err());
     let mut bad = sphere(0.);
-    bad.extent_shape[3] = 3.;
+    bad.extent_shape[3] = 5.;
     assert!(Bvh::build(&[bad]).is_err());
     let mut bad = sphere(0.);
     bad.center_radius = [f32::MAX, 0., 0., f32::MAX];
     assert!(Bvh::build(&[bad]).is_err());
+}
+
+#[test]
+fn presets_are_valid_reproducible_and_independent_of_slot() {
+    use scene::WorldPreset;
+    for preset in WorldPreset::ALL {
+        let pair = scene::selected_worlds(42, [preset, preset]);
+        assert_eq!(pair[0], pair[1]);
+        assert_eq!(pair, scene::selected_worlds(42, [preset, preset]));
+        assert_ne!(pair, scene::selected_worlds(43, [preset, preset]));
+        assert!(pair[0].len() < 512);
+        assert!(
+            pair[0]
+                .iter()
+                .any(|o| o.emission[..3].iter().any(|e| *e > 0.))
+        );
+        check(&pair[0], &Bvh::build(&pair[0]).unwrap());
+    }
 }

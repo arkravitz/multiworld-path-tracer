@@ -6,6 +6,7 @@ struct Params {
     controls: vec4<f32>, // p, persistence, exposure stops, query/display bitmask (1/2 BVH worlds, 4 fast linear, 8 fused display)
     flags: vec4<u32>, // spatial probability, primary A, world A count, world B count
     acceleration: vec4<u32>, // node counts A/B, unbounded plane counts A/B
+    lights: vec4<u32>, // finite light counts A/B, MIS enabled, reserved
     noise: vec4<f32>, // threshold, frequency, softness, time offset
     eye: vec4<f32>, forward: vec4<f32>, right: vec4<f32>, up: vec4<f32>,
 }
@@ -13,7 +14,7 @@ struct Object { center: vec4<f32>, extent: vec4<f32>, color: vec4<f32>, emission
 struct Node { low: vec3<f32>, escape: u32, high: vec3<f32>, object: u32 }
 struct Pixel { a: vec4<f32>, b: vec4<f32>, stats_a: vec4<f32>, stats_b: vec4<f32>, normals_a: vec4<f32>, normals_b: vec4<f32> }
 struct Frame { sample: vec4<f32>, position_a: vec4<f32>, normal_a: vec4<f32>, albedo_a: vec4<f32>, position_b: vec4<f32>, normal_b: vec4<f32>, albedo_b: vec4<f32> }
-struct Hit { t: f32, normal: vec3<f32>, color: vec3<f32>, emission: vec3<f32>, metal: f32 }
+struct Hit { t: f32, normal: vec3<f32>, color: vec3<f32>, emission: vec3<f32>, metal: f32, light_pdf: f32 }
 struct Result { radiance: vec3<f32>, stats: vec3<f32>, normal: vec3<f32> }
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> world_a: array<Object>;
@@ -24,6 +25,17 @@ struct Result { radiance: vec3<f32>, stats: vec3<f32>, normal: vec3<f32> }
 @group(0) @binding(6) var<storage, read> bvh_b: array<Node>;
 @group(0) @binding(7) var<storage, read_write> frames: array<Frame>;
 
+// One-dimensional randomized base-2 sequence for the initial world decision.
+// Only that decision is stratified: independent RNGs still drive geometry and
+// later Markov transitions. Absolute sample indices preserve dispatch invariance.
+var<private> sequence_sample: u32;
+var<private> sequence_scramble: u32;
+var<private> sequence_active: bool;
+fn initial_world_random(state: ptr<function,u32>) -> f32 {
+    let fallback = random(state); // preserve transition stream dimensions
+    if !sequence_active { return fallback; }
+    return f32((reverseBits(sequence_sample)^sequence_scramble)>>8u)*(1.0/16777216.0);
+}
 fn hash(v: u32) -> u32 {
     var x = v; x = (x ^ (x >> 16u)) * 0x21f0aaadu;
     x = (x ^ (x >> 15u)) * 0x735a2d97u; return x ^ (x >> 15u);
@@ -53,6 +65,54 @@ fn probability(origin: vec3<f32>) -> f32 {
 fn choose(origin: vec3<f32>, state: ptr<function,u32>) -> u32 {
     return select(1u,0u,random(state) < probability(origin));
 }
+// Ellipsoid intersections are sphere intersections in scaled local coordinates.
+fn ellipsoid_distance(o: Object, ro: vec3<f32>, rd: vec3<f32>) -> f32 {
+    let oc=(ro-o.center.xyz)/o.extent.xyz; let direction=rd/o.extent.xyz;
+    let a=dot(direction,direction); let b=dot(oc,direction);
+    let disc=b*b-a*(dot(oc,oc)-1.0);
+    if disc < 0.0 { return 1e30; }
+    var t=(-b-sqrt(disc))/a;
+    if t<=0.001 { t=(-b+sqrt(disc))/a; }
+    return select(1e30,t,t>0.001);
+}
+// Finite cylinder plus hemispherical caps, including inside-origin exits.
+fn capsule_distance(o: Object, ro: vec3<f32>, rd: vec3<f32>) -> f32 {
+    let start = o.center.xyz-o.extent.xyz;
+    let axis = 2.0*o.extent.xyz;
+    let length2 = dot(axis,axis);
+    let oc = ro-start;
+    let radius2 = o.center.w*o.center.w;
+    var closest = 1e30;
+    if length2 > 1e-12 {
+        let along = dot(axis,rd); let projected = dot(axis,oc);
+        let a = 1.0-along*along/length2;
+        let b = dot(oc,rd)-projected*along/length2;
+        let c = dot(oc,oc)-projected*projected/length2-radius2;
+        let disc = b*b-a*c;
+        if a > 1e-8 && disc >= 0.0 {
+            let root = sqrt(disc);
+            for (var side=0u;side<2u;side++) {
+                let t = (-b+select(-root,root,side==1u))/a;
+                let y = projected+t*along;
+                if t > 0.001 && y >= 0.0 && y <= length2 { closest = min(closest,t); }
+            }
+        }
+    }
+    for (var end=0u;end<2u;end++) {
+        let delta = ro-(start+f32(end)*axis);
+        let b = dot(delta,rd); let disc = b*b-dot(delta,delta)+radius2;
+        if disc >= 0.0 {
+            let root = sqrt(disc);
+            for (var side=0u;side<2u;side++) {
+                let t = -b+select(-root,root,side==1u);
+                let y = dot(ro+t*rd-start,axis);
+                if t > 0.001 && (length2 <= 1e-12 || (end==0u && y<=0.0) || (end==1u && y>=length2)) { closest=min(closest,t); }
+            }
+        }
+    }
+    return closest;
+}
+
 fn primitive(o: Object, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
     var t = 1e30; var normal = vec3<f32>(0.0);
     if o.extent.w < 0.5 {
@@ -82,17 +142,32 @@ fn primitive(o: Object, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
             t = far; normal = fnorm;
             if near > 0.001 { t = near; normal = nn; }
         }
-    } else if abs(rd.y) > 1e-8 {
-        let root = (o.center.y-ro.y)/rd.y;
-        if root > 0.001 { t = root; normal = vec3<f32>(0.0,1.0,0.0); }
+    } else if o.extent.w < 2.5 {
+        if abs(rd.y) > 1e-8 {
+            let root = (o.center.y-ro.y)/rd.y;
+            if root > 0.001 { t = root; normal = vec3<f32>(0.0,1.0,0.0); }
+        }
+    } else if o.extent.w < 3.5 {
+        t = capsule_distance(o,ro,rd);
+        if t < 1e29 {
+            let start = o.center.xyz-o.extent.xyz; let axis = 2.0*o.extent.xyz;
+            let u = clamp(dot(ro+t*rd-start,axis)/max(1e-12,dot(axis,axis)),0.0,1.0);
+            normal = normalize(ro+t*rd-start-u*axis);
+        }
+    }
+    else {
+        t=ellipsoid_distance(o,ro,rd);
+        if t<1e29 {normal=normalize((ro+t*rd-o.center.xyz)/(o.extent.xyz*o.extent.xyz));}
     }
     // Two-sided surfaces, including when switching places the origin inside an object.
     if dot(normal,rd) > 0.0 { normal = -normal; }
-    return Hit(t,normal,o.color.xyz,o.emission.xyz,o.color.w);
+    var pdf = 0.0;
+    if params.lights.z != 0u && t < 1e29 { pdf = emitter_pdf(o,ro,rd,t,normal); }
+    return Hit(t,normal,o.color.xyz,o.emission.xyz,o.color.w,pdf);
 }
 // Retained as an independently traversed correctness and performance reference.
 fn intersect_brute(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
-    var closest = Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0);
+    var closest = Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0);
     let count = select(params.flags.z,params.flags.w,world==1u);
     for (var i=0u; i<count; i++) {
         var o: Object;
@@ -129,6 +204,8 @@ fn primitive_distance(o: Object, ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         if far <= 0.001 { return 1e30; }
         return select(far,near,near>0.001);
     }
+    if o.extent.w > 3.5 { return ellipsoid_distance(o,ro,rd); }
+    if o.extent.w > 2.5 { return capsule_distance(o,ro,rd); }
     if abs(rd.y) > 1e-8 {
         let root = (o.center.y-ro.y)/rd.y;
         if root > 0.001 { return root; }
@@ -163,7 +240,7 @@ fn bounds_hit(node: Node, ro: vec3<f32>, rd: vec3<f32>, inv: vec3<f32>, limit: f
     return near <= far;
 }
 fn intersect_bvh(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
-    var closest = Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0);
+    var closest = Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0);
     var nearest_id = 0xffffffffu;
     let plane_count = select(params.acceleration.z,params.acceleration.w,world==1u);
     let node_count = select(params.acceleration.x,params.acceleration.y,world==1u);
@@ -202,13 +279,140 @@ fn intersect_linear_fast(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
         if t < nearest { nearest = t; nearest_id = i; }
     }
     if nearest_id != 0xffffffffu { return primitive(object_at(world,nearest_id),ro,rd); }
-    return Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0);
+    return Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0);
 }
 fn intersect(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
     if (u32(params.controls.w) & (1u << world)) != 0u { return intersect_bvh(world,ro,rd); }
     if (u32(params.controls.w) & 4u) != 0u { return intersect_linear_fast(world,ro,rd); }
     return intersect_brute(world,ro,rd);
 }
+const PI: f32 = 3.14159265359;
+fn power_weight(a: f32, b: f32) -> f32 {
+    // Ratio form avoids squaring large solid-angle densities.
+    if a <= 0.0 { return 0.0; }
+    let r = b/a;
+    return 1.0/(1.0+r*r);
+}
+fn sphere_cone(o: Object, ro: vec3<f32>) -> f32 {
+    let ratio = min(1.0,o.center.w*o.center.w/dot(o.center.xyz-ro,o.center.xyz-ro));
+    return ratio/(1.0+sqrt(1.0-ratio)); // stable 1-cos(theta_max)
+}
+fn box_face_areas(o: Object, ro: vec3<f32>) -> vec3<f32> {
+    let d = abs(ro-o.center.xyz);
+    let inside = all(d < o.extent.xyz);
+    let areas = 4.0*o.extent.yzx*o.extent.zxy;
+    return areas*select(select(vec3<f32>(0.0),vec3<f32>(1.0),d>=o.extent.xyz),vec3<f32>(2.0),inside);
+}
+fn emitter_pdf(o: Object, ro: vec3<f32>, rd: vec3<f32>, t: f32, normal: vec3<f32>) -> f32 {
+    if o.emission.w <= 0.0 { return 0.0; }
+    if o.extent.w < 0.5 {
+        if distance(ro,o.center.xyz) <= o.center.w { return o.emission.w/(4.0*PI); }
+        return o.emission.w/(2.0*PI*sphere_cone(o,ro));
+    }
+    let areas = box_face_areas(o,ro);
+    let area = areas.x+areas.y+areas.z;
+    return o.emission.w*t*t/max(1e-20,area*abs(dot(normal,rd)));
+}
+fn oriented_direction(n: vec3<f32>, cos_theta: f32, phi: f32) -> vec3<f32> {
+    let helper = select(vec3<f32>(0.0,0.0,1.0),vec3<f32>(1.0,0.0,0.0),abs(n.z)>0.999);
+    let tangent = normalize(cross(helper,n)); let bitangent = cross(n,tangent);
+    let sin_theta = sqrt(max(0.0,1.0-cos_theta*cos_theta));
+    return normalize(tangent*(sin_theta*cos(phi)) + bitangent*(sin_theta*sin(phi)) + n*cos_theta);
+}
+// Early-out visibility, bounded at the sampled light. No shading for occluders.
+fn shadow_occluded(world: u32, ro: vec3<f32>, rd: vec3<f32>, limit: f32) -> bool {
+    if (u32(params.controls.w) & (1u << world)) == 0u {
+        let count = select(params.flags.z,params.flags.w,world==1u);
+        for (var i=0u; i<count; i++) {
+            if primitive_distance(object_at(world,i),ro,rd) < limit { return true; }
+        }
+        return false;
+    }
+    let planes = select(params.acceleration.z,params.acceleration.w,world==1u);
+    let count = select(params.acceleration.x,params.acceleration.y,world==1u);
+    for (var i=0u; i<planes; i++) {
+        if primitive_distance(object_at(world,node_at(world,i).object),ro,rd) < limit { return true; }
+    }
+    let inv = 1.0/select(rd,vec3<f32>(1.0),rd==vec3<f32>(0.0));
+    var cursor = planes;
+    loop {
+        if cursor >= count { break; }
+        let node = node_at(world,cursor);
+        if !bounds_hit(node,ro,rd,inv,limit) { cursor = node.escape; continue; }
+        if node.object != 0xffffffffu {
+            if primitive_distance(object_at(world,node.object),ro,rd) < limit { return true; }
+        }
+        cursor++;
+    }
+    return false;
+}
+struct LightDirection { object: Object, direction: vec3<f32> }
+fn sample_light_direction(world: u32, ro: vec3<f32>, state: ptr<function,u32>) -> LightDirection {
+    let count = select(params.lights.x,params.lights.y,world==1u);
+    let offset = select(params.acceleration.x,params.acceleration.y,world==1u);
+    let u = random(state);
+    var low = 0u; var high = count-1u;
+    loop {
+        if low >= high { break; }
+        let mid = (low+high)/2u;
+        if u < node_at(world,offset+mid).low.x { high = mid; } else { low = mid+1u; }
+    }
+    let o = object_at(world,node_at(world,offset+low).object);
+    var direction: vec3<f32>;
+    if o.extent.w < 0.5 {
+        let delta = o.center.xyz-ro;
+        if dot(delta,delta) <= o.center.w*o.center.w {
+            direction = oriented_direction(vec3<f32>(0.0,1.0,0.0),1.0-2.0*random(state),2.0*PI*random(state));
+        } else {
+            direction = oriented_direction(normalize(delta),1.0-random(state)*sphere_cone(o,ro),2.0*PI*random(state));
+        }
+    } else {
+        let areas = box_face_areas(o,ro);
+        let total = areas.x+areas.y+areas.z;
+        var face = random(state)*total;
+        var axis = 0u;
+        if face >= areas.x { face -= areas.x; axis = 1u;
+            if face >= areas.y { face -= areas.y; axis = 2u; }
+        }
+        let inside = all(abs(ro-o.center.xyz) < o.extent.xyz);
+        var side = select(-1.0,1.0,ro[axis]>=o.center[axis]);
+        if inside { side = select(-1.0,1.0,face>=areas[axis]*0.5); }
+        var point = o.center.xyz;
+        point[axis] += side*o.extent[axis];
+        let a = (axis+1u)%3u; let b = (axis+2u)%3u;
+        point[a] += (2.0*random(state)-1.0)*o.extent[a];
+        point[b] += (2.0*random(state)-1.0)*o.extent[b];
+        direction = normalize(point-ro);
+    }
+    return LightDirection(o,direction);
+}
+fn light_direction_pdf(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> f32 {
+    let count = select(params.lights.x,params.lights.y,world==1u);
+    let offset = select(params.acceleration.x,params.acceleration.y,world==1u);
+    var pdf = 0.0;
+    // Sum all proposal densities, including lights behind occluders or other
+    // emitters. Visibility belongs to transport, never to this directional PDF.
+    for (var i=0u; i<count; i++) {
+        let o = object_at(world,node_at(world,offset+i).object);
+        let h = primitive(o,ro,rd);
+        if h.t < 1e29 { pdf += h.light_pdf; }
+    }
+    return pdf;
+}
+fn direct_light(world: u32, ro: vec3<f32>, normal: vec3<f32>, state: ptr<function,u32>) -> vec3<f32> {
+    let count = select(params.lights.x,params.lights.y,world==1u);
+    if count == 0u { return vec3<f32>(0.0); }
+    let sample = sample_light_direction(world,ro,state);
+    let o = sample.object; let direction = sample.direction;
+    let cosine = max(0.0,dot(normal,direction));
+    if cosine <= 0.0 { return vec3<f32>(0.0); }
+    let hit = primitive(o,ro,direction);
+    if hit.t > 1e29 || hit.light_pdf <= 0.0 { return vec3<f32>(0.0); }
+    if shadow_occluded(world,ro,direction,hit.t-max(0.0001,hit.t*0.00001)) { return vec3<f32>(0.0); }
+    let bsdf_pdf = cosine/PI;
+    return o.emission.xyz*(bsdf_pdf/hit.light_pdf)*power_weight(hit.light_pdf,bsdf_pdf);
+}
+
 fn cosine_direction(n: vec3<f32>, state: ptr<function,u32>) -> vec3<f32> {
     let u = random(state); let phi = 6.28318530718*random(state);
     let helper = select(vec3<f32>(0.0,0.0,1.0),vec3<f32>(1.0,0.0,0.0),abs(n.z)>0.999);
@@ -216,6 +420,10 @@ fn cosine_direction(n: vec3<f32>, state: ptr<function,u32>) -> vec3<f32> {
     return normalize(tangent*(sqrt(u)*cos(phi)) + bitangent*(sqrt(u)*sin(phi)) + n*sqrt(1.0-u));
 }
 fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
+    var light_rng = hash(seed ^ 0x7f4a7c15u);
+    var previous_pdf = 0.0;
+    let switching = mode >= 4u && (params.flags.x != 0u || (params.controls.x > 0.0 && params.controls.x < 1.0)) && (mode != 5u || params.controls.y < 1.0);
+    let directional_mis = params.lights.z != 0u && switching;
     var rng = seed; var selection_rng = hash(seed ^ 0xa511e9b3u);
     var ro = ro_in; var rd = rd_in;
     var throughput = vec3<f32>(1.0); var radiance = vec3<f32>(0.0);
@@ -232,22 +440,16 @@ fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
             let distance = min(primary_a.t,primary_b.t);
             var p = params.controls.x; // Empty space has no surface anchor.
             if distance < 1e29 { p = probability(ro+distance*rd); }
-            world = select(1u,0u,random(&selection_rng)<p);
-        } else { world = choose(ro,&selection_rng); }
+            world = select(1u,0u,initial_world_random(&selection_rng)<p);
+        } else { world = select(1u,0u,initial_world_random(&selection_rng)<probability(ro)); }
     }
     if mode >= 3u && params.flags.y != 0u { world = 0u; }
     let primary = world;
+    var pending_switch = false;
     var switches = 0u; var bounces = 0u; var primary_normal = vec3<f32>(0.0);
     for (var bounce=0u; bounce<params.transport.y; bounce++) {
-        if bounce > 0u && mode >= 4u {
-            let previous = world;
-            var resample = mode == 4u || params.controls.y <= 0.0;
-            if mode == 5u && params.controls.y > 0.0 && params.controls.y < 1.0 {
-                resample = random(&selection_rng) >= params.controls.y;
-            }
-            if resample { world = choose(ro,&selection_rng); }
-            if world != previous { switches++; }
-        }
+        if pending_switch { switches++; }
+        pending_switch = false;
         var hit: Hit;
         if bounce == 0u && cached_primary {
             if world == 0u { hit = primary_a; } else { hit = primary_b; }
@@ -257,9 +459,12 @@ fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
         }
         bounces++;
         if bounce == 0u { primary_normal = hit.normal*0.5+0.5; }
-        radiance += throughput*hit.emission;
+        var emission_weight = 1.0;
+        if previous_pdf > 0.0 && hit.light_pdf > 0.0 { emission_weight = power_weight(previous_pdf,hit.light_pdf); }
+        radiance += throughput*hit.emission*emission_weight;
         if max(hit.color.x,max(hit.color.y,hit.color.z)) == 0.0 { break; }
         let position = ro+hit.t*rd;
+        previous_pdf = 0.0;
         if hit.metal > 0.5 { rd = reflect(rd,hit.normal); }
         else { rd = cosine_direction(hit.normal,&rng); }
         // Lambertian: f*cos/pdf = (albedo/pi)*cos/(cos/pi) = albedo.
@@ -269,6 +474,36 @@ fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
             let survival = clamp(max(throughput.x,max(throughput.y,throughput.z)),0.05,0.95);
             if random(&rng) >= survival { break; }
             throughput /= survival;
+        }
+        // NEE and continuation condition on the SAME next segment world. The
+        // transition probability is part of the transport process, not a PDF
+        // to divide out. Selection happens after roulette, as in the reference.
+        if bounce+1u >= params.transport.y { break; }
+        if mode >= 4u {
+            let previous = world;
+            var resample = mode == 4u || params.controls.y <= 0.0;
+            if mode == 5u && params.controls.y > 0.0 && params.controls.y < 1.0 {
+                resample = random(&selection_rng) >= params.controls.y;
+            }
+            if resample { world = choose(ro,&selection_rng); }
+            pending_switch = world != previous;
+        }
+        if params.lights.z != 0u && hit.metal <= 0.5 {
+            if directional_mis {
+                let count = select(params.lights.x,params.lights.y,world==1u);
+                if count > 0u {
+                    // One-sample balance MIS: use one continuing ray instead of
+                    // a separate shadow ray in the expensive stochastic modes.
+                    if random(&light_rng) < 0.5 { rd = sample_light_direction(world,ro,&light_rng).direction; }
+                    let cosine_pdf = max(0.0,dot(hit.normal,rd))/PI;
+                    if cosine_pdf <= 0.0 { break; }
+                    let mixture_pdf = 0.5*(cosine_pdf+light_direction_pdf(world,ro,rd));
+                    throughput *= cosine_pdf/mixture_pdf;
+                }
+            } else {
+                previous_pdf = max(0.0,dot(hit.normal,rd))/PI;
+                radiance += throughput*direct_light(world,ro,hit.normal,&light_rng);
+            }
         }
     }
     return Result(radiance,vec3<f32>(select(0.0,1.0,primary==0u),f32(switches),f32(bounces)),primary_normal);
@@ -300,6 +535,9 @@ fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     var fresh_a=vec3<f32>(0.0); var fresh_b=vec3<f32>(0.0);
     let pixel_seed = index ^ hash(params.transport.z);
     for (var sample=0u; sample<params.size.z; sample++) {
+        sequence_sample = params.size.w+sample;
+        sequence_scramble = hash(pixel_seed ^ 0xe7037ed1u);
+        sequence_active = params.lights.z != 0u;
         let seed = hash(pixel_seed ^ hash(params.size.w+sample));
         var camera_rng = hash(seed ^ 0x63d83595u);
         let uv = (vec2<f32>(id.xy)+vec2<f32>(random(&camera_rng),random(&camera_rng)))/vec2<f32>(params.size.xy);

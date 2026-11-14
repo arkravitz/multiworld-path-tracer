@@ -4,3 +4,5 @@ pub mod geometry;
 pub mod gpu;
 pub mod scene;
 pub mod settings;
+
+pub mod sampling;

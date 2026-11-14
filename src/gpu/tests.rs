@@ -37,6 +37,13 @@ fn probe_queries(@builtin(global_invocation_id) id:vec3<u32>) {
     probes[id.x].bvh_emission=vec4<f32>(b.emission,0.0);
 }
 @compute @workgroup_size(64)
+fn probe_radiance(@builtin(global_invocation_id) id:vec3<u32>) {
+    if id.x>=arrayLength(&probes) {return;}
+    let p=probes[id.x];
+    let result=trace(p.origin.xyz,p.direction.xyz,hash(u32(p.direction.w)),params.transport.x);
+    probes[id.x].brute_color=vec4<f32>(result.radiance,0.0);
+}
+@compute @workgroup_size(64)
 fn probe_primary_world(@builtin(global_invocation_id) id:vec3<u32>) {
     if id.x>=arrayLength(&probes) {return;}
     let p=probes[id.x];
@@ -213,6 +220,20 @@ fn bvh_gpu_queries_match_linear_for_both_worlds_and_edge_cases() {
     let mut fixtures = vec![
         scene::worlds(42),
         scene::worlds(12345),
+        scene::selected_worlds(
+            42,
+            [
+                scene::WorldPreset::SunkenTemple,
+                scene::WorldPreset::BioluminescentGrove,
+            ],
+        ),
+        scene::selected_worlds(
+            42,
+            [
+                scene::WorldPreset::LunarObservatory,
+                scene::WorldPreset::NeonDistrict,
+            ],
+        ),
         [vec![], vec![]],
         [vec![object([0.; 3], 2., [0.5; 3])], vec![]],
     ];
@@ -577,4 +598,307 @@ fn temporal_denoiser_preserves_raw_samples_and_rejects_wrong_world_history() {
     assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
     let _ = std::fs::remove_file(a);
     let _ = std::fs::remove_file(b);
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn light_sampling_preserves_energy_and_reduces_variance() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 1, 1, 42).unwrap();
+    let floor = Object {
+        center_radius: [0.; 4],
+        extent_shape: [0., 0., 0., 2.],
+        color_material: [0.8, 0.8, 0.8, 0.],
+        emission: [0.; 4],
+    };
+    let sphere = Object {
+        center_radius: [0., 3., 0., 0.5],
+        extent_shape: [0.; 4],
+        color_material: [0.; 4],
+        emission: [2., 1., 0.5, 0.],
+    };
+    let samples = 32768;
+    let probes: Vec<_> = (0..samples)
+        .map(|i| {
+            let mut p = probe(Vec3::Y, -Vec3::Y, 0);
+            p.direction[3] = i as f32;
+            p
+        })
+        .collect();
+    // Exact on-axis sphere irradiance, including the integrator's origin offset.
+    let fraction = (0.5_f64 / (3. - 0.002)).powi(2);
+    let square_k = 1.0_f64 / (1.0_f64 + (2.5_f64 - 0.002).powi(2)).sqrt();
+    let square_fraction = 4.0 / std::f64::consts::PI * square_k * square_k.atan();
+    for (name, light, hybrid, mirror, depth, blocked, expected) in [
+        (
+            "box",
+            Object {
+                extent_shape: [1., 0.5, 1., 1.],
+                ..sphere
+            },
+            false,
+            false,
+            2,
+            false,
+            std::array::from_fn(|c| {
+                0.8 * ([0.045, 0.055, 0.075][c] * (1. - square_fraction)
+                    + f64::from(sphere.emission[c]) * square_fraction)
+            }),
+        ),
+        (
+            "hybrid box",
+            Object {
+                extent_shape: [1., 0.5, 1., 1.],
+                ..sphere
+            },
+            true,
+            false,
+            2,
+            false,
+            std::array::from_fn(|c| {
+                0.8 * ([0.045, 0.055, 0.075][c] * (1. - 0.5 * square_fraction)
+                    + f64::from(sphere.emission[c]) * 0.5 * square_fraction)
+            }),
+        ),
+        (
+            "overlapping proposals",
+            sphere,
+            true,
+            false,
+            2,
+            false,
+            std::array::from_fn(|c| {
+                0.8 * ([0.045, 0.055, 0.075][c] * (1. - 0.5 * fraction)
+                    + f64::from(sphere.emission[c]) * 0.5 * fraction)
+            }),
+        ),
+        (
+            "sphere",
+            sphere,
+            false,
+            false,
+            2,
+            false,
+            std::array::from_fn(|c| {
+                0.8 * ([0.045, 0.055, 0.075][c] * (1. - fraction)
+                    + f64::from(sphere.emission[c]) * fraction)
+            }),
+        ),
+        (
+            "hybrid sphere",
+            sphere,
+            true,
+            false,
+            2,
+            false,
+            std::array::from_fn(|c| {
+                0.8 * ([0.045, 0.055, 0.075][c] * (1. - 0.5 * fraction)
+                    + f64::from(sphere.emission[c]) * 0.5 * fraction)
+            }),
+        ),
+        (
+            "inside sphere",
+            Object {
+                center_radius: [0., 0., 0., 4.],
+                ..sphere
+            },
+            false,
+            false,
+            2,
+            false,
+            [1.6, 0.8, 0.4],
+        ),
+        (
+            "inside box",
+            Object {
+                center_radius: [0.; 4],
+                extent_shape: [4., 4., 4., 1.],
+                ..sphere
+            },
+            false,
+            false,
+            2,
+            false,
+            [1.6, 0.8, 0.4],
+        ),
+        ("mirror", sphere, false, true, 2, false, [1.6, 0.8, 0.4]),
+        ("depth truncation", sphere, false, false, 1, false, [0.; 3]),
+        ("occluded", sphere, false, false, 2, true, [0.; 3]),
+    ] {
+        let mut floor = floor;
+        floor.color_material[3] = if mirror { 1. } else { 0. };
+        let mut a = vec![floor];
+        let mut b = if hybrid {
+            vec![light]
+        } else {
+            a.push(light);
+            vec![]
+        };
+        if name == "overlapping proposals" {
+            b.push(Object {
+                center_radius: [0., 3., 0., 0.25],
+                ..sphere
+            });
+        }
+        if blocked {
+            a.push(Object {
+                center_radius: [0., 1.5, 0., 0.],
+                extent_shape: [0., 0., 0., 2.],
+                color_material: [0.; 4],
+                emission: [0.; 4],
+            });
+        }
+        r.set_worlds(&[a, b]).unwrap();
+        let mut variances = [0.; 2];
+        for enabled in [false, true] {
+            let mut params = Params::zeroed();
+            params.transport = [if hybrid { 4 } else { 0 }, depth, 42, 0];
+            params.controls = [0.5, 0.8, 0., 7.];
+            params.flags = [
+                0,
+                u32::from(hybrid),
+                r.worlds[0].object_count,
+                r.worlds[1].object_count,
+            ];
+            params.acceleration = [
+                r.worlds[0].node_count,
+                r.worlds[1].node_count,
+                r.worlds[0].plane_count,
+                r.worlds[1].plane_count,
+            ];
+            params.lights = [
+                r.worlds[0].light_count,
+                r.worlds[1].light_count,
+                u32::from(enabled),
+                0,
+            ];
+            let out = dispatch_probes(&r, &probes, &params, "probe_radiance");
+            let means: [f64; 3] = std::array::from_fn(|c| {
+                out.iter().map(|p| f64::from(p.brute_color[c])).sum::<f64>() / f64::from(samples)
+            });
+            for c in 0..3 {
+                assert!(
+                    (means[c] - expected[c]).abs() < 0.008,
+                    "{name} MIS={enabled}: {means:?} expected {expected:?}"
+                );
+            }
+            variances[usize::from(enabled)] = out
+                .iter()
+                .map(|p| (f64::from(p.brute_color[0]) - means[0]).powi(2))
+                .sum::<f64>()
+                / f64::from(samples);
+            eprintln!(
+                "{name}, MIS={enabled}: mean={means:?}, red variance={}",
+                variances[usize::from(enabled)]
+            );
+        }
+        if name == "sphere" {
+            assert!(
+                variances[1] * 10. < variances[0],
+                "MIS must reduce sphere-light variance"
+            );
+        }
+    }
+    r.set_worlds(&[vec![floor], vec![floor]]).unwrap();
+    for (p, expected_a) in [(0.25, 8.), (0.5, 16.), (0.75, 24.)] {
+        let mut settings = Settings {
+            mode: Mode::PerPath,
+            p,
+            depth: 2,
+            spp: 32,
+            ..Default::default()
+        };
+        r.reset();
+        r.accumulate(&settings);
+        let full = r.read_pixels().unwrap();
+        assert_eq!(
+            full[0].stats_a[0], expected_a,
+            "stratified initial-world count"
+        );
+        r.reset();
+        settings.spp = 7;
+        r.accumulate(&settings);
+        settings.spp = 25;
+        r.accumulate(&settings);
+        assert_pixels(
+            &full,
+            &r.read_pixels().unwrap(),
+            "stratified irregular batches",
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn curved_geometry_matches_cpu_and_world_selection_rebuilds_atomically() {
+    use crate::{geometry, scene::WorldPreset};
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 16, 12, 42).unwrap();
+    let mut capsule = object([0., 0., 0.], 3., [0.5; 3]);
+    capsule.center_radius[3] = 0.5;
+    capsule.extent_shape = [0.5, 1.5, -0.3, 3.];
+    let mut ellipse = object([0., 0., 0.], 4., [0.5; 3]);
+    ellipse.extent_shape = [2., 0.4, 0.8, 4.];
+    let scenes = [vec![capsule], vec![ellipse]];
+    r.set_worlds(&scenes).unwrap();
+    let rays = sample_rays(&scenes);
+    let out = queries(&r, &rays);
+    assert_queries(&out);
+    for p in &out {
+        let origin = Vec3::from_slice(&p.origin[..3]);
+        let direction = Vec3::from_slice(&p.direction[..3]);
+        let expected = if p.origin[3] == 0. {
+            let half = Vec3::from_slice(&capsule.extent_shape[..3]);
+            geometry::capsule(origin, direction, -half, half, 0.5)
+        } else {
+            geometry::ellipsoid(origin, direction, Vec3::ZERO, Vec3::new(2., 0.4, 0.8))
+        };
+        if let Some(mut hit) = expected {
+            if hit.normal.dot(direction) > 0. {
+                hit.normal = -hit.normal;
+            }
+            assert!(
+                (p.bvh_t_normal[0] - hit.t).abs() < 0.002,
+                "curved t: {:?} vs {}",
+                p.bvh_t_normal,
+                hit.t
+            );
+            assert!(Vec3::from_slice(&p.bvh_t_normal[1..]).abs_diff_eq(hit.normal, 0.005));
+        } else {
+            assert!(p.bvh_t_normal[0] > 1e29);
+        }
+    }
+    let mut s = Settings {
+        worlds: [WorldPreset::SunkenTemple, WorldPreset::BioluminescentGrove],
+        spp: 2,
+        denoise: true,
+        ..Default::default()
+    };
+    r.render(&s, true);
+    assert_eq!(r.scene_presets, s.worlds);
+    assert_eq!(r.samples, 2);
+    s.worlds[1] = WorldPreset::NeonDistrict;
+    r.render(&s, false);
+    assert_eq!(r.scene_presets, s.worlds);
+    assert_eq!(r.samples, 0);
+    let generated = scene::selected_worlds(s.seed, s.worlds);
+    assert_eq!(r.worlds[1].object_count, generated[1].len() as u32);
+    r.render(&s, true);
+    let restarted = r.read_pixels().unwrap();
+    let mut fresh = Renderer::new(r.device.clone(), r.queue.clone(), 16, 12, 42).unwrap();
+    fresh.render(&s, true);
+    assert_pixels(
+        &restarted,
+        &fresh.read_pixels().unwrap(),
+        "preset change discards old accumulation",
+    );
+    // Explicit uploaded scenes persist until a seed or preset selection changes.
+    r.set_worlds(&scenes).unwrap();
+    r.render(&s, true);
+    assert_eq!(r.worlds[0].object_count, 1);
+    s.seed = 43;
+    r.render(&s, true);
+    assert_eq!(r.scene_seed, 43);
+    assert_eq!(r.scene_presets, s.worlds);
+    assert!(r.worlds[0].object_count > 1);
 }

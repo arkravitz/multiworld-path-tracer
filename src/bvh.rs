@@ -61,7 +61,7 @@ impl Bvh {
             );
             let shape = object.extent_shape[3];
             ensure!(
-                shape == 0.0 || shape == 1.0 || shape == 2.0,
+                shape == 0.0 || shape == 1.0 || shape == 2.0 || shape == 3.0 || shape == 4.0,
                 "Object {id} has an unsupported shape"
             );
             if shape == 2.0 {
@@ -80,8 +80,19 @@ impl Bvh {
                     "Sphere {id} must have positive radius"
                 );
                 Vec3::splat(object.center_radius[3])
+            } else if shape == 3.0 {
+                ensure!(
+                    object.center_radius[3] > 0.0,
+                    "Capsule {id} must have positive radius"
+                );
+                Vec3::from_slice(&object.extent_shape[..3]).abs()
+                    + Vec3::splat(object.center_radius[3])
             } else {
                 let e = Vec3::from_slice(&object.extent_shape[..3]);
+                ensure!(
+                    shape != 4.0 || e.cmpgt(Vec3::ZERO).all(),
+                    "Ellipsoid {id} must have positive radii"
+                );
                 ensure!(
                     e.cmpge(Vec3::ZERO).all(),
                     "Box {id} has negative half extents"

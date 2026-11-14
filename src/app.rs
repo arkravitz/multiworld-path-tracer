@@ -1,5 +1,6 @@
 use crate::{
     gpu::{self, Renderer},
+    scene::WorldPreset,
     settings::{Mode, Settings, View},
 };
 use anyhow::{Context, Result};
@@ -86,6 +87,54 @@ impl App {
         ui.heading("MULTIWORLD");
         ui.label("Stochastic transport lab");
         ui.separator();
+        ui.label("Worlds");
+        for (slot, label) in [(0, "World A"), (1, "World B")] {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                egui::ComboBox::from_id_salt(("world-preset", slot))
+                    .selected_text(self.settings.worlds[slot].label())
+                    .width(210.)
+                    .show_ui(ui, |ui| {
+                        for preset in WorldPreset::ALL {
+                            ui.selectable_value(
+                                &mut self.settings.worlds[slot],
+                                preset,
+                                preset.label(),
+                            )
+                            .on_hover_text(preset.description());
+                        }
+                    });
+            });
+            ui.small(self.settings.worlds[slot].description());
+        }
+        if ui.button("Swap A ↔ B").clicked() {
+            self.settings.worlds.swap(0, 1);
+        }
+        ui.collapsing("Suggested pairings", |ui| {
+            for (label, pair) in [
+                (
+                    "Temple × grove",
+                    [WorldPreset::SunkenTemple, WorldPreset::BioluminescentGrove],
+                ),
+                (
+                    "Observatory × neon",
+                    [WorldPreset::LunarObservatory, WorldPreset::NeonDistrict],
+                ),
+                (
+                    "Temple × neon",
+                    [WorldPreset::SunkenTemple, WorldPreset::NeonDistrict],
+                ),
+                (
+                    "Original spheres × boxes",
+                    [WorldPreset::WarmSpheres, WorldPreset::CoolBoxes],
+                ),
+            ] {
+                if ui.button(label).clicked() {
+                    self.settings.worlds = pair;
+                }
+            }
+        });
+        ui.separator();
         egui::ComboBox::from_label("Transport")
             .selected_text(self.settings.mode.label())
             .show_ui(ui, |ui| {
@@ -102,6 +151,13 @@ impl App {
             ui.small("Blend weight updates without restarting A or B.");
         }
         ui.separator();
+        ui.checkbox(
+            &mut self.settings.light_sampling,
+            "Importance sampling (MIS)",
+        )
+        .on_hover_text(
+            "Power-weighted lights, solid-angle sampling, and stratified world selection.",
+        );
         ui.checkbox(&mut self.settings.use_bvh, "BVH acceleration");
         if self.settings.use_bvh {
             ui.checkbox(

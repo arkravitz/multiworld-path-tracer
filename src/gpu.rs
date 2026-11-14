@@ -37,6 +37,7 @@ struct Params {
     controls: [f32; 4],
     flags: [u32; 4],
     acceleration: [u32; 4],
+    lights: [u32; 4],
     noise: [f32; 4],
     eye: [f32; 4],
     forward: [f32; 4],
@@ -74,6 +75,7 @@ pub struct Renderer {
     trace: [wgpu::ComputePipeline; 6],
     present: wgpu::ComputePipeline,
     scene_seed: u32,
+    scene_presets: [scene::WorldPreset; 2],
     previous: Option<Settings>,
     needs_clear: bool,
     display_dirty: bool,
@@ -188,6 +190,10 @@ impl Renderer {
             trace,
             present,
             scene_seed: seed,
+            scene_presets: [
+                scene::WorldPreset::WarmSpheres,
+                scene::WorldPreset::CoolBoxes,
+            ],
             previous: None,
             needs_clear: true,
             display_dirty: true,
@@ -285,11 +291,12 @@ impl Renderer {
                 self.reset();
             }
         }
-        if self.scene_seed != settings.seed {
-            let scenes = scene::worlds(settings.seed);
+        if self.scene_seed != settings.seed || self.scene_presets != settings.worlds {
+            let scenes = scene::selected_worlds(settings.seed, settings.worlds);
             self.set_worlds(&scenes)
                 .expect("generated geometry must fit the GPU scene limits");
             self.scene_seed = settings.seed;
+            self.scene_presets = settings.worlds;
             self.reset();
         }
         if settings.denoise && self.denoiser.is_none() {
@@ -384,6 +391,12 @@ impl Renderer {
                 self.worlds[1].node_count,
                 self.worlds[0].plane_count,
                 self.worlds[1].plane_count,
+            ],
+            lights: [
+                self.worlds[0].light_count,
+                self.worlds[1].light_count,
+                settings.light_sampling as u32,
+                0,
             ],
             noise: [
                 settings.threshold,
@@ -660,10 +673,18 @@ struct GpuWorld {
     node_count: u32,
     plane_count: u32,
     prefer_linear: bool,
+    light_count: u32,
 }
 impl GpuWorld {
     fn new(device: &wgpu::Device, objects: &[scene::Object]) -> Result<Self> {
-        let bvh = Bvh::build(objects)?;
+        let mut bvh = Bvh::build(objects)?;
+        let node_count = bvh.nodes.len() as u32;
+        let (objects, lights) = crate::sampling::prepare(objects);
+        let light_count = lights.len() as u32;
+        // Compact CDF records share the acceleration allocation after its nodes.
+        // Traversal keeps its original logical count; no extra GPU bindings.
+        bvh.nodes.extend(lights);
+        let objects = objects.as_slice();
         let limit = device
             .limits()
             .max_storage_buffer_binding_size
@@ -698,12 +719,15 @@ impl GpuWorld {
             geometry,
             nodes,
             object_count: objects.len() as u32,
-            node_count: bvh.nodes.len() as u32,
+            node_count,
+            light_count,
             plane_count: bvh.plane_count,
             // Measured on the target M1: <=32 finite spheres are cheaper to
             // query linearly. Boxes, mixed shapes, and larger worlds use BVHs.
             prefer_linear: objects.len() - bvh.plane_count as usize <= 32
-                && objects.iter().all(|o| o.extent_shape[3] != 1.0),
+                && objects
+                    .iter()
+                    .all(|o| o.extent_shape[3] == 0.0 || o.extent_shape[3] == 2.0),
         })
     }
 }

@@ -1,12 +1,67 @@
 use bytemuck::{Pod, Zeroable};
+use clap::ValueEnum;
+mod presets;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum WorldPreset {
+    WarmSpheres,
+    CoolBoxes,
+    SunkenTemple,
+    NeonDistrict,
+    LunarObservatory,
+    BioluminescentGrove,
+}
+impl WorldPreset {
+    pub const ALL: [Self; 6] = [
+        Self::SunkenTemple,
+        Self::BioluminescentGrove,
+        Self::LunarObservatory,
+        Self::NeonDistrict,
+        Self::WarmSpheres,
+        Self::CoolBoxes,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WarmSpheres => "Warm spheres · original",
+            Self::CoolBoxes => "Cool boxes · original",
+            Self::SunkenTemple => "Sunken temple",
+            Self::NeonDistrict => "Neon district",
+            Self::LunarObservatory => "Lunar observatory",
+            Self::BioluminescentGrove => "Bioluminescent grove",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::WarmSpheres => "Warm diffuse spheres and gold mirrors.",
+            Self::CoolBoxes => "Cool blue boxes and silver mirrors.",
+            Self::SunkenTemple => "Sandstone arcades, gold relics and amber lanterns.",
+            Self::NeonDistrict => "Stepped towers, cyan rails, pink light and chrome.",
+            Self::LunarObservatory => "Silver orbital rings and suspended planets.",
+            Self::BioluminescentGrove => "Twisted branches, mushroom canopies and glowing pods.",
+        }
+    }
+}
+pub fn selected_worlds(seed: u32, presets: [WorldPreset; 2]) -> [Vec<Object>; 2] {
+    presets.map(|preset| match preset {
+        WorldPreset::WarmSpheres => worlds(seed)[0].clone(),
+        WorldPreset::CoolBoxes => worlds(seed)[1].clone(),
+        WorldPreset::SunkenTemple => presets::temple(seed),
+        WorldPreset::NeonDistrict => presets::neon(seed),
+        WorldPreset::LunarObservatory => presets::observatory(seed),
+        WorldPreset::BioluminescentGrove => presets::grove(seed),
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct Object {
     pub center_radius: [f32; 4],
-    /// Half extents and shape: 0 sphere, 1 box, 2 horizontal plane.
+    /// Half extents and shape: 0 sphere, 1 box, 2 horizontal plane,
+    /// 3 capsule (xyz is midpoint-to-end vector), 4 ellipsoid (xyz is radii).
     pub extent_shape: [f32; 4],
     /// RGB reflectance and material: 0 Lambertian, 1 perfect mirror.
     pub color_material: [f32; 4],
+    /// RGB emitted radiance; the fourth component is reserved for GPU light metadata.
     pub emission: [f32; 4],
 }
 /// Specified integer PRNG; scene generation is stable across Rust versions.
@@ -71,7 +126,7 @@ pub fn worlds(seed: u32) -> [Vec<Object>; 2] {
                 });
             }
         }
-        // Broad, low-hanging lights make unassisted indirect sampling practical.
+        // Three finite area emitters per world.
         let positions = [[-4., 4.2, -2.], [3., 4.8, 0.], [0., 3.8, -4.]];
         for (i, pos) in positions.into_iter().enumerate() {
             let rgb = if world == 0 {

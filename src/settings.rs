@@ -1,3 +1,4 @@
+use crate::scene::WorldPreset;
 use clap::ValueEnum;
 use glam::Vec3;
 
@@ -22,8 +23,8 @@ impl Mode {
     ];
     pub fn label(self) -> &'static str {
         match self {
-            Self::WorldA => "1 · World A / spheres",
-            Self::WorldB => "2 · World B / cubes",
+            Self::WorldA => "1 · World A only",
+            Self::WorldB => "2 · World B only",
             Self::Blend => "3 · Image-space blend",
             Self::PerPath => "4 · Once per path",
             Self::PerBounce => "5 · Independent per bounce",
@@ -71,7 +72,9 @@ impl View {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub mode: Mode,
+    pub worlds: [WorldPreset; 2],
     pub use_bvh: bool,
+    pub light_sampling: bool,
     pub adaptive_bvh: bool,
     pub denoise: bool,
     pub denoise_strength: f32,
@@ -96,7 +99,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             mode: Mode::PerBounce,
+            worlds: [WorldPreset::WarmSpheres, WorldPreset::CoolBoxes],
             use_bvh: true,
+            light_sampling: true,
             adaptive_bvh: true,
             denoise: false,
             denoise_strength: 0.8,

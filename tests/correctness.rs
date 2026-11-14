@@ -78,6 +78,10 @@ fn accumulation_invalidation_distinguishes_display_and_transport() {
     let mut s = old.clone();
     s.seed += 1;
     assert!(s.invalidates(&old));
+    let mut s = old.clone();
+    s.light_sampling = false;
+    assert!(s.invalidates(&old));
+    assert!(!s.history_compatible(&old));
 }
 
 #[test]
@@ -103,4 +107,51 @@ fn horizontal_orbit_wraps_continuously_in_both_directions() {
     let last = s.yaw;
     s.set_orbit_yaw(f32::NAN);
     assert_eq!(s.yaw, last);
+}
+
+#[test]
+fn capsule_body_caps_inside_exit_and_degenerate_axis() {
+    use multiworld_path_tracer::geometry::capsule;
+    let start = -Vec3::Y;
+    let end = Vec3::Y;
+    for (origin, direction, t, normal) in [
+        (Vec3::Z * 3., -Vec3::Z, 2.5, Vec3::Z),
+        (Vec3::Y * 3., -Vec3::Y, 1.5, Vec3::Y),
+        (Vec3::ZERO, Vec3::X, 0.5, Vec3::X),
+        (Vec3::ZERO, Vec3::Y, 1.5, Vec3::Y),
+        (-Vec3::Y * 3., Vec3::Y, 1.5, -Vec3::Y),
+    ] {
+        let hit = capsule(origin, direction, start, end, 0.5).unwrap();
+        assert!((hit.t - t).abs() < 1e-6);
+        assert!(hit.normal.abs_diff_eq(normal, 1e-6));
+    }
+    assert!(capsule(Vec3::Z * 3., Vec3::Z, start, end, 0.5).is_none());
+    assert!(capsule(Vec3::ZERO, Vec3::ZERO, start, end, 0.5).is_none());
+    let hit = capsule(Vec3::Z * 3., -Vec3::Z, Vec3::ZERO, Vec3::ZERO, 0.5).unwrap();
+    assert!((hit.t - 2.5).abs() < 1e-6);
+}
+
+#[test]
+fn selecting_or_swapping_worlds_invalidates_accumulation_and_history() {
+    let old = Settings::default();
+    let mut changed = old.clone();
+    changed.worlds[1] = scene::WorldPreset::SunkenTemple;
+    assert!(changed.invalidates(&old));
+    assert!(!changed.history_compatible(&old));
+    let mut swapped = old.clone();
+    swapped.worlds.swap(0, 1);
+    assert!(swapped.invalidates(&old));
+    assert!(!swapped.history_compatible(&old));
+}
+
+#[test]
+fn ellipsoid_flattened_cap_and_inside_exit() {
+    use multiworld_path_tracer::geometry::ellipsoid;
+    let radii = Vec3::new(2., 0.4, 0.8);
+    let h = ellipsoid(Vec3::Y * 3., -Vec3::Y, Vec3::ZERO, radii).unwrap();
+    assert!((h.t - 2.6).abs() < 1e-5);
+    assert!(h.normal.abs_diff_eq(Vec3::Y, 1e-5));
+    let h = ellipsoid(Vec3::ZERO, Vec3::X, Vec3::ZERO, radii).unwrap();
+    assert!((h.t - 2.).abs() < 1e-5);
+    assert!(h.normal.abs_diff_eq(Vec3::X, 1e-5));
 }
