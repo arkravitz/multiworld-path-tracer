@@ -4,6 +4,36 @@ A Rust + WGSL research playground that samples incompatible worlds during light 
 
 Choose each world independently from six presets. The app opens with a warm **Sunken temple** and a cool **Bioluminescent grove**. Switch either dropdown, swap A/B, or choose a suggested pairing without restarting. Every world shares the same coordinate space, so geometry, reflections and illumination can cross between them. Geometry and sampling are reproducible from an explicit integer seed.
 
+## World collisions
+
+**Overgrown sanctuary · Temple × grove.** A luminous tree grows through a broken arcade; the probability field cuts between sandstone and living branches in shared space.
+
+![Overgrown sanctuary: a bioluminescent tree and mushrooms merge with amber-lit stone arches](docs/images/combos/17-forest-portal-close.png)
+
+| Neon orrery · Observatory × neon | Portal garden · Neon × grove |
+| --- | --- |
+| <img src="docs/images/combos/15-two-realities.png" width="400" alt="Neon orrery: silver orbital rings and a golden planet suspended inside a cyan and magenta skyline"> | <img src="docs/images/combos/11-portal-garden.png" width="400" alt="Portal garden: glowing mushrooms and branching trees reclaim a fragmented neon district"> |
+
+| Electric ruins · Temple × neon | Clockwork sanctuary · Observatory × temple |
+| --- | --- |
+| <img src="docs/images/combos/03-electric-ruins.png" width="400" alt="Electric ruins: stone arches and golden relics illuminated by cyan and pink light from another world"> | <img src="docs/images/combos/18-orbital-ruins.png" width="400" alt="Clockwork sanctuary: golden stone arches intersect a silver planetary orrery"> |
+
+**Midnight forest · Grove × neon.** The grove borrows another world's light. Cyan mushroom caps, purple branches and mirror surfaces pick up the neon district's illumination and reflections.
+
+![Midnight forest: a dark alien grove with luminous mushroom caps, cyan and purple branches, and chrome reflecting a neon city](docs/images/combos/05-midnight-forest.png)
+
+These six images were selected from **18 exploratory compositions** and rendered at **960×720, 1,024 spp, seed 42, depth 12**, with MIS enabled and denoising off. All are direct GPU PNG exports with exposure, Reinhard tone mapping and sRGB conversion. The spatial views use persistent world switching; **Neon orrery** redraws the world independently at every bounce. **Electric ruins** and **Midnight forest** lock primary rays to A and choose B for 84% of secondary segments.
+
+[Exact camera, lighting and transport settings](docs/combo-gallery.md) accompany every capture. Reproduce all six, or explore the complete 18-shot set:
+
+```sh
+cargo run --release --example combo_gallery -- --output output/combo-gallery/final
+# Quick exploration of all 18 cameras and transport recipes:
+cargo run --release --example combo_gallery -- --explore --width 400 --height 300 --samples 128 --output output/combo-gallery/drafts
+# Render just one recipe:
+cargo run --release --example combo_gallery -- --only 15-two-realities
+```
+
 ## World presets
 
 | World | What to explore |
@@ -15,6 +45,9 @@ Choose each world independently from six presets. The app opens with a warm **Su
 | Warm spheres · original | The original warm sphere and mirror experiment. |
 | Cool boxes · original | The original blue box and mirror experiment. |
 
+<details>
+<summary>Individual world previews</summary>
+
 | Sunken temple | Bioluminescent grove |
 | --- | --- |
 | ![Temple preset](docs/images/preset-temple.png) | ![Grove preset](docs/images/preset-grove.png) |
@@ -24,6 +57,8 @@ Choose each world independently from six presets. The app opens with a warm **Su
 | ![Observatory preset](docs/images/preset-observatory.png) | ![Neon preset](docs/images/preset-neon.png) |
 
 These are raw GPU captures at 400×300, 256 spp, seed 42; denoising is off. All new geometry is generated locally: native capsule beams form arches, roots and orbital rings; ellipsoids form broad mushroom caps. No asset download or external file path is required. Each set has a small number of sphere/box area lights supported by MIS.
+
+</details>
 
 Use **World A** and **World B** at the top of the sidebar. **Swap A ↔ B** swaps the selected scenes while preserving the current probability, camera and transport settings. **Suggested pairings** includes Temple × grove, Observatory × neon and the original pair. Selections work in all six transport modes, with spatial probability, primary-A locking, BVHs, MIS and denoising. Changing a preset resets raw accumulation and temporal history, including while paused; changing the seed regenerates the selected presets. Choosing the same preset in both slots produces identical worlds.
 
@@ -45,7 +80,8 @@ Generated renders, benchmark reports, build artifacts and locally packaged apps 
 
 The CLI defaults to Temple × grove. `Settings::default()` and `scene::worlds(seed)` retain the original scenes for existing library clients and benchmark reproducibility. `scene::selected_worlds(seed, presets)` generates any selected pair. Explicit `Renderer::set_worlds` uploads remain active until a preset or seed selection changes.
 
-## Original experiment gallery
+<details>
+<summary>Original sphere-and-box experiment gallery</summary>
 
 ![Spatially sampled sphere and cube worlds, seen from the opposite orbit](docs/images/spatial-orbit.png)
 
@@ -76,6 +112,8 @@ These are direct GPU render captures from this program. The radiance gallery use
 ```sh
 cargo run --release --example gallery -- --output output/gallery
 ```
+
+</details>
 
 ## Build and run
 
@@ -240,6 +278,7 @@ At `p=0.5`, mode 3/4 has expectation `p*a*e + (1-p)*E`. Mode 5 has expectation `
 - `src/bvh.rs`: deterministic surface-area BVH construction and flat GPU node layout.
 - `src/sampling.rs`: power-weighted light distributions and upload metadata.
 - `examples/sampling_benchmark.rs`: raw error and completion-timed sampling comparisons.
+- `examples/combo_gallery.rs`: reproducible camera and transport recipes for the world-collision gallery.
 - `examples/benchmark.rs`: warmed, GPU-completion-timed reference/optimized comparisons.
 - `src/settings.rs`: transport settings, camera and accumulation invalidation.
 - `src/geometry.rs`: CPU intersection references for tests.
