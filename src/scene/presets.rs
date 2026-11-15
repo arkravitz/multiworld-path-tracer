@@ -415,3 +415,88 @@ pub(super) fn grove(seed: u32) -> Vec<Object> {
     ));
     o
 }
+
+pub(super) fn glass_gallery(seed: u32) -> Vec<Object> {
+    use super::{GlassPreset as G, mesh};
+    use glam::Mat4;
+    let mut o = floor([0.68, 0.71, 0.75]);
+    o.push(block(
+        [0., 2.8, -5.5],
+        [6.5, 2.8, 0.15],
+        [0.07, 0.10, 0.16],
+        false,
+    ));
+    o.extend(mesh::instance(
+        mesh::teapot(),
+        Mat4::from_translation(Vec3::new(0., 0.6, 0.))
+            * Mat4::from_rotation_y(-0.25 + Rng(seed ^ 0x94a11).range(-0.08, 0.08))
+            * Mat4::from_scale(Vec3::splat(0.95)),
+        G::Clear.material(),
+    ));
+    for (p, r, g) in [
+        ([-3.6, 1.35, 2.2], 0.75, G::Amber),
+        ([3.6, 1.45, 1.8], 0.85, G::Sapphire),
+    ] {
+        let mut s = sphere(p, r, [1.; 3], false);
+        s.color_material = g.material();
+        o.push(s);
+    }
+    for (p, r, e) in [
+        ([-2.5, 6.5, 1.], 0.38, [40., 32., 22.]),
+        ([3., 6., -1.5], 0.5, [24., 34., 48.]),
+        ([0., 3.5, -4.5], 0.6, [7., 5., 12.]),
+    ] {
+        o.push(lamp(sphere(p, r, [0.; 3], false), e));
+    }
+    // Slender light rails give the curved glass recognizable reflected edges.
+    for x in [-5.2, 5.2] {
+        o.push(lamp(
+            block([x, 3., -3.], [0.035, 2.5, 0.035], [0.; 3], false),
+            [5., 7., 10.],
+        ));
+    }
+    o
+}
+pub(super) fn crystal_garden(seed: u32) -> Vec<Object> {
+    use super::{GlassPreset as G, mesh};
+    use glam::Mat4;
+    let mut o = floor([0.72, 0.68, 0.59]);
+    o.push(block(
+        [0., 2.8, -5.5],
+        [6.5, 2.8, 0.15],
+        [0.10, 0.07, 0.13],
+        false,
+    ));
+    o.extend(mesh::instance(
+        mesh::suzanne(),
+        Mat4::from_translation(Vec3::new(0., 2.1, 0.))
+            * Mat4::from_rotation_y(0.4 + Rng(seed ^ 0x731b).range(-0.08, 0.08))
+            * Mat4::from_scale(Vec3::splat(1.6)),
+        G::Emerald.material(),
+    ));
+    for (p, r, g) in [
+        ([-3.4, 1.5, 1.], 0.8, G::Diamond),
+        ([3.5, 1.25, 1.5], 0.7, G::Amber),
+    ] {
+        let mut s = ellipsoid(p, [r, r * 1.3, r], [1.; 3]);
+        s.color_material = g.material();
+        o.push(s);
+    }
+    arc(
+        &mut o,
+        Vec3::new(0., 1.9, -3.5),
+        [Vec3::X, Vec3::Y],
+        [3.5, 0.045],
+        [0.8, 0.55, 0.25],
+        true,
+        TAU,
+    );
+    for (p, r, e) in [
+        ([0., 7., 1.], 0.4, [42., 38., 30.]),
+        ([-3.5, 6., -1.], 0.4, [25., 35., 45.]),
+        ([3.5, 6., 2.], 0.4, [45., 24., 12.]),
+    ] {
+        o.push(lamp(sphere(p, r, [0.; 3], false), e));
+    }
+    o
+}

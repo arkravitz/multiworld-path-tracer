@@ -17,3 +17,6 @@
 .aws/
 .codex/
 .agents/
+
+# Locally installed third-party denoiser runtime (install with scripts/install-oidn.sh)
+/.deps/

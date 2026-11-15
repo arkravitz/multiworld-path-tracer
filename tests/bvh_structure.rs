@@ -37,6 +37,12 @@ fn check(objects: &[Object], bvh: &Bvh) {
             ids.push(n.object);
             let o = &objects[n.object as usize];
             let c = Vec3::from_slice(&o.center_radius[..3]);
+            if o.extent_shape[3] == 5. {
+                let b = c + Vec3::from_slice(&o.extent_shape[..3]);
+                let d = c + Vec3::from_slice(&o.emission[..3]);
+                assert!(low.cmple(c.min(b).min(d)).all() && high.cmpge(c.max(b).max(d)).all());
+                continue;
+            }
             let e = if o.extent_shape[3] == 0. {
                 Vec3::splat(o.center_radius[3])
             } else if o.extent_shape[3] == 3. {
@@ -115,7 +121,7 @@ fn presets_are_valid_reproducible_and_independent_of_slot() {
         assert_eq!(pair[0], pair[1]);
         assert_eq!(pair, scene::selected_worlds(42, [preset, preset]));
         assert_ne!(pair, scene::selected_worlds(43, [preset, preset]));
-        assert!(pair[0].len() < 512);
+        assert!(pair[0].len() < 16384);
         assert!(
             pair[0]
                 .iter()

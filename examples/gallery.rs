@@ -23,6 +23,7 @@ fn main() -> Result<()> {
     let (device, queue) = pollster::block_on(gpu::headless_device())?;
     let mut renderer = Renderer::new(device, queue, args.width, args.height, 42)?;
     let base = Settings {
+        denoiser: multiworld_path_tracer::settings::DenoiserKind::Temporal,
         exposure: 1.,
         spp: 8,
         ..Default::default()

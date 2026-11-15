@@ -12,6 +12,7 @@ bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 eframe = { version = "=0.36.2", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 glam = "0.30"
+libloading = "0.8.9"
 png = "0.18"
 pollster = "0.4"
 wgpu = "30"
@@ -22,3 +23,6 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 1
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in", "msl-out"] }

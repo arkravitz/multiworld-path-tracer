@@ -3,8 +3,8 @@ use clap::Parser;
 use multiworld_path_tracer::{
     app,
     gpu::{self, Renderer},
-    scene::WorldPreset,
-    settings::{Mode, Settings},
+    scene::{GlassPreset, WorldPreset},
+    settings::{DenoiserKind, Mode, SamplingMode, Settings},
 };
 use std::{path::PathBuf, time::Instant};
 #[derive(Parser, Debug)]
@@ -24,6 +24,21 @@ struct Args {
     /// Filter display/PNG only; raw linear estimates remain unchanged.
     #[arg(long)]
     denoise: bool,
+    #[arg(long, value_enum, default_value = "oidn")]
+    denoiser: DenoiserKind,
+    #[arg(long, value_enum, default_value = "uniform")]
+    sampling: SamplingMode,
+    /// Experimental biased online neural radiance cache; fused GPU kernels.
+    #[arg(long)]
+    neural_cache: bool,
+    /// Targeted light tracing and progressive photon gathering (fixed worlds/blend).
+    #[arg(long)]
+    caustics: bool,
+    #[arg(long, default_value_t = 0)]
+    cache_bounce: u32,
+    /// Shorten training paths using learned lighting; retain 1/16 uncached anchors.
+    #[arg(long, requires = "neural_cache")]
+    cache_self_training: bool,
     /// Render all six modes using the same camera, seed, and sample budget.
     #[arg(long, requires = "headless")]
     all_modes: bool,
@@ -33,11 +48,15 @@ struct Args {
     world_a: WorldPreset,
     #[arg(long, value_enum, default_value = "bioluminescent-grove")]
     world_b: WorldPreset,
+    #[arg(long, value_enum, default_value = "assorted")]
+    glass_a: GlassPreset,
+    #[arg(long, value_enum, default_value = "assorted")]
+    glass_b: GlassPreset,
     #[arg(long, default_value_t = 800)]
     width: u32,
     #[arg(long, default_value_t = 600)]
     height: u32,
-    /// Total samples per pixel in headless mode (blend traces this many in EACH world).
+    /// Average camera samples per pixel in headless mode (per world for blend).
     #[arg(long, default_value_t = 256)]
     samples: u32,
     #[arg(long, default_value_t = 1)]
@@ -76,14 +95,29 @@ fn main() -> Result<()> {
         (0.0..=1.0).contains(&args.probability) && (0.0..=1.0).contains(&args.persistence),
         "Probability and persistence must be finite and in [0,1]"
     );
+    ensure!(
+        (0..=63).contains(&args.cache_bounce),
+        "--cache-bounce must be in 0..=63 (0 uses path spread)"
+    );
+    ensure!(
+        args.sampling != SamplingMode::Denoised || args.denoiser == DenoiserKind::Oidn,
+        "Denoising-aware sampling requires the OIDN denoiser"
+    );
     ensure!(args.exposure.is_finite(), "Exposure must be finite");
     let mut settings = Settings {
         mode: args.mode,
         worlds: [args.world_a, args.world_b],
+        glass: [args.glass_a, args.glass_b],
         light_sampling: !args.no_light_sampling,
         use_bvh: !args.brute_force,
         adaptive_bvh: !args.force_bvh,
-        denoise: args.denoise,
+        denoise: args.denoise || args.sampling == SamplingMode::Denoised,
+        denoiser: args.denoiser,
+        sampling: args.sampling,
+        neural_cache: args.neural_cache,
+        caustics: args.caustics,
+        cache_bounce: args.cache_bounce,
+        cache_self_training: args.cache_self_training,
         p: args.probability,
         persistence: args.persistence,
         spp: args.spp,
@@ -131,8 +165,26 @@ fn main() -> Result<()> {
         settings.worlds[0].label(),
         settings.worlds[1].label()
     ));
+    report.push_str(&format!(
+        "Glass A: {}; Glass B: {}\n",
+        settings.glass[0].label(),
+        settings.glass[1].label()
+    ));
+    report.push_str(&format!(
+        "Sampling: {:?}; denoiser: {:?}\n",
+        settings.sampling, settings.denoiser
+    ));
+    report.push_str(&format!(
+        "Neural cache: {}, cache bounce: {}, self-training: {}\n",
+        settings.neural_cache, settings.cache_bounce, settings.cache_self_training
+    ));
     for mode in modes {
         settings.mode = mode;
+        report.push_str(&format!(
+            "Fast caustics requested: {}; active: {}\n",
+            settings.caustics,
+            settings.caustics_active()
+        ));
         renderer.reset();
         let start = Instant::now();
         while renderer.samples < args.samples {

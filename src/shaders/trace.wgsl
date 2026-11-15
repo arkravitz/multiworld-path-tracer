@@ -1,21 +1,29 @@
 override DENOISE_INPUT: bool = false;
 override ACTIVE_MODE: u32 = 4u;
+override ADAPTIVE_TRACE:bool=false;
 struct Params {
     size: vec4<u32>, // width, height, samples this dispatch, previous samples
     transport: vec4<u32>, // mode, max depth, seed, debug view
     controls: vec4<f32>, // p, persistence, exposure stops, query/display bitmask (1/2 BVH worlds, 4 fast linear, 8 fused display)
     flags: vec4<u32>, // spatial probability, primary A, world A count, world B count
     acceleration: vec4<u32>, // node counts A/B, unbounded plane counts A/B
-    lights: vec4<u32>, // finite light counts A/B, MIS enabled, reserved
+    lights: vec4<u32>, // finite light counts A/B, MIS enabled, worlds with glass bitmask
+    neural: vec4<u32>, // enabled, first cache bounce, training batch, self-training
+    reconstruction:vec4<f32>, // OIDN strength, allocation policy, uniform warmup epochs, reserved
     noise: vec4<f32>, // threshold, frequency, softness, time offset
     eye: vec4<f32>, forward: vec4<f32>, right: vec4<f32>, up: vec4<f32>,
 }
 struct Object { center: vec4<f32>, extent: vec4<f32>, color: vec4<f32>, emission: vec4<f32> }
 struct Node { low: vec3<f32>, escape: u32, high: vec3<f32>, object: u32 }
-struct Pixel { a: vec4<f32>, b: vec4<f32>, stats_a: vec4<f32>, stats_b: vec4<f32>, normals_a: vec4<f32>, normals_b: vec4<f32> }
+// Scan metadata has independent scalar memory locations. Different workgroups
+// publish different members of the same record; vector components would alias
+// under the shader memory model and permit lost updates on Metal.
+struct Allocation {x:f32,y:f32,z:f32,w:f32}
+struct Schedule {x:u32,y:u32,z:u32,w:u32}
+struct Pixel { a: vec4<f32>, b: vec4<f32>, stats_a: vec4<f32>, stats_b: vec4<f32>, normals_a: vec4<f32>, normals_b: vec4<f32>, guide_normal_a:vec4<f32>, guide_albedo_a:vec4<f32>, guide_normal_b:vec4<f32>, guide_albedo_b:vec4<f32>, moment_a:vec4<f32>, moment_b:vec4<f32>, light_a:vec4<f32>, light_b:vec4<f32>, allocation:Allocation, work:vec4<u32>, schedule:Schedule, half_a:vec4<f32>, half_b:vec4<f32>, counts:vec4<u32> }
 struct Frame { sample: vec4<f32>, position_a: vec4<f32>, normal_a: vec4<f32>, albedo_a: vec4<f32>, position_b: vec4<f32>, normal_b: vec4<f32>, albedo_b: vec4<f32> }
-struct Hit { t: f32, normal: vec3<f32>, color: vec3<f32>, emission: vec3<f32>, metal: f32, light_pdf: f32 }
-struct Result { radiance: vec3<f32>, stats: vec3<f32>, normal: vec3<f32> }
+struct Hit { t: f32, normal: vec3<f32>, color: vec3<f32>, emission: vec3<f32>, metal: f32, light_pdf: f32, front: f32 }
+struct Result { radiance: vec3<f32>, stats: vec3<f32>, normal: vec3<f32>, guide_normal:vec3<f32>, guide_albedo:vec3<f32> }
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> world_a: array<Object>;
 @group(0) @binding(2) var<storage, read> world_b: array<Object>;
@@ -23,7 +31,7 @@ struct Result { radiance: vec3<f32>, stats: vec3<f32>, normal: vec3<f32> }
 @group(0) @binding(4) var output: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(5) var<storage, read> bvh_a: array<Node>;
 @group(0) @binding(6) var<storage, read> bvh_b: array<Node>;
-@group(0) @binding(7) var<storage, read_write> frames: array<Frame>;
+@group(0) @binding(7) var<storage, read_write> frame_store: FrameStore;
 
 // One-dimensional randomized base-2 sequence for the initial world decision.
 // Only that decision is stratified: independent RNGs still drive geometry and
@@ -113,6 +121,15 @@ fn capsule_distance(o: Object, ro: vec3<f32>, rd: vec3<f32>) -> f32 {
     return closest;
 }
 
+// Two-sided Moller-Trumbore intersection. Tolerance closes tessellation seams;
+// the geometric winding remains available for dielectric entry/exit decisions.
+fn triangle_distance(o:Object,ro:vec3<f32>,rd:vec3<f32>)->f32 {
+    let p=cross(rd,o.emission.xyz);let det=dot(o.extent.xyz,p);
+    if abs(det)<1e-9 {return 1e30;}
+    let v=ro-o.center.xyz;let u=dot(v,p)/det;let q=cross(v,o.extent.xyz);
+    let w=dot(rd,q)/det;let t=dot(o.emission.xyz,q)/det;
+    return select(1e30,t,u>=-1e-6 && w>=-1e-6 && u+w<=1.000001 && t>0.001);
+}
 fn primitive(o: Object, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
     var t = 1e30; var normal = vec3<f32>(0.0);
     if o.extent.w < 0.5 {
@@ -155,19 +172,24 @@ fn primitive(o: Object, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
             normal = normalize(ro+t*rd-start-u*axis);
         }
     }
-    else {
+    else if o.extent.w<4.5 {
         t=ellipsoid_distance(o,ro,rd);
         if t<1e29 {normal=normalize((ro+t*rd-o.center.xyz)/(o.extent.xyz*o.extent.xyz));}
     }
+    else {
+        t=triangle_distance(o,ro,rd);
+        if t<1e29 {normal=normalize(cross(o.extent.xyz,o.emission.xyz));}
+    }
+    let front=select(0.0,1.0,dot(normal,rd)<=0.0);
     // Two-sided surfaces, including when switching places the origin inside an object.
     if dot(normal,rd) > 0.0 { normal = -normal; }
     var pdf = 0.0;
     if params.lights.z != 0u && t < 1e29 { pdf = emitter_pdf(o,ro,rd,t,normal); }
-    return Hit(t,normal,o.color.xyz,o.emission.xyz,o.color.w,pdf);
+    return Hit(t,normal,o.color.xyz,select(o.emission.xyz,vec3<f32>(0.0),o.extent.w>4.5),o.color.w,pdf,front);
 }
 // Retained as an independently traversed correctness and performance reference.
 fn intersect_brute(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
-    var closest = Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0);
+    var closest = Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0,0.0);
     let count = select(params.flags.z,params.flags.w,world==1u);
     for (var i=0u; i<count; i++) {
         var o: Object;
@@ -204,6 +226,7 @@ fn primitive_distance(o: Object, ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         if far <= 0.001 { return 1e30; }
         return select(far,near,near>0.001);
     }
+    if o.extent.w > 4.5 {return triangle_distance(o,ro,rd);}
     if o.extent.w > 3.5 { return ellipsoid_distance(o,ro,rd); }
     if o.extent.w > 2.5 { return capsule_distance(o,ro,rd); }
     if abs(rd.y) > 1e-8 {
@@ -240,7 +263,7 @@ fn bounds_hit(node: Node, ro: vec3<f32>, rd: vec3<f32>, inv: vec3<f32>, limit: f
     return near <= far;
 }
 fn intersect_bvh(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
-    var closest = Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0);
+    var closest = Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0,0.0);
     var nearest_id = 0xffffffffu;
     let plane_count = select(params.acceleration.z,params.acceleration.w,world==1u);
     let node_count = select(params.acceleration.x,params.acceleration.y,world==1u);
@@ -279,12 +302,50 @@ fn intersect_linear_fast(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
         if t < nearest { nearest = t; nearest_id = i; }
     }
     if nearest_id != 0xffffffffu { return primitive(object_at(world,nearest_id),ro,rd); }
-    return Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0);
+    return Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0,0.0);
 }
 fn intersect(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
     if (u32(params.controls.w) & (1u << world)) != 0u { return intersect_bvh(world,ro,rd); }
     if (u32(params.controls.w) & 4u) != 0u { return intersect_linear_fast(world,ro,rd); }
     return intersect_brute(world,ro,rd);
+}
+// A glass-only query reconstructs the incident medium for camera-inside rays
+// and after a world switch. Closed, non-overlapping solids have an exit as their
+// nearest boundary when the ray origin is inside their volume.
+fn glass_boundary(world:u32,ro:vec3<f32>,rd:vec3<f32>)->Hit {
+    var nearest=1e30;var nearest_id=0xffffffffu;
+    if (u32(params.controls.w)&(1u<<world))!=0u {
+        let count=select(params.acceleration.x,params.acceleration.y,world==1u);
+        var cursor=select(params.acceleration.z,params.acceleration.w,world==1u);
+        let inv=1.0/select(rd,vec3<f32>(1.0),rd==vec3<f32>(0.0));
+        loop {
+            if cursor>=count {break;}
+            let node=node_at(world,cursor);
+            if !bounds_hit(node,ro,rd,inv,nearest) {cursor=node.escape;continue;}
+            if node.object!=0xffffffffu {
+                let o=object_at(world,node.object);
+                if o.color.w>=2.0 {let t=primitive_distance(o,ro,rd);if t<nearest {nearest=t;nearest_id=node.object;}}
+            }
+            cursor++;
+        }
+    }else {
+        let count=select(params.flags.z,params.flags.w,world==1u);
+        for(var i=0u;i<count;i++) {
+            let o=object_at(world,i);if o.color.w<2.0 {continue;}
+            let t=primitive_distance(o,ro,rd);if t<nearest {nearest=t;nearest_id=i;}
+        }
+    }
+    if nearest_id!=0xffffffffu {return primitive(object_at(world,nearest_id),ro,rd);}
+    return Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0,0.0);
+}
+fn dielectric_fresnel(cosine:f32,eta_i:f32,eta_t:f32)->f32 {
+    if abs(eta_i-eta_t)<1e-6 {return 0.0;}
+    let sin2_t=(eta_i/eta_t)*(eta_i/eta_t)*max(0.0,1.0-cosine*cosine);
+    if sin2_t>=1.0 {return 1.0;}
+    let ct=sqrt(max(0.0,1.0-sin2_t));
+    let parallel=(eta_t*cosine-eta_i*ct)/(eta_t*cosine+eta_i*ct);
+    let perpendicular=(eta_i*cosine-eta_t*ct)/(eta_i*cosine+eta_t*ct);
+    return 0.5*(parallel*parallel+perpendicular*perpendicular);
 }
 const PI: f32 = 3.14159265359;
 fn power_weight(a: f32, b: f32) -> f32 {
@@ -319,7 +380,7 @@ fn oriented_direction(n: vec3<f32>, cos_theta: f32, phi: f32) -> vec3<f32> {
     let sin_theta = sqrt(max(0.0,1.0-cos_theta*cos_theta));
     return normalize(tangent*(sin_theta*cos(phi)) + bitangent*(sin_theta*sin(phi)) + n*cos_theta);
 }
-// Early-out visibility, bounded at the sampled light. No shading for occluders.
+// Early-channel visibility, bounded at the sampled light. No shading for occluders.
 fn shadow_occluded(world: u32, ro: vec3<f32>, rd: vec3<f32>, limit: f32) -> bool {
     if (u32(params.controls.w) & (1u << world)) == 0u {
         let count = select(params.flags.z,params.flags.w,world==1u);
@@ -420,13 +481,19 @@ fn cosine_direction(n: vec3<f32>, state: ptr<function,u32>) -> vec3<f32> {
     return normalize(tangent*(sqrt(u)*cos(phi)) + bitangent*(sqrt(u)*sin(phi)) + n*sqrt(1.0-u));
 }
 fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
+    var training_prefix:array<vec3<f32>,4>;var training_scale:array<vec3<f32>,4>;var training_count=0u;
+    var training_suffix=false;var training_bootstrapped=false;var training_terminal_scale=vec3<f32>(0.0);
     var light_rng = hash(seed ^ 0x7f4a7c15u);
+    var guide_normal=vec3<f32>(0.0);var guide_albedo=vec3<f32>(1.0);var guide_weight=vec3<f32>(1.0);var guide_found=false;var guide_only=false;
     var previous_pdf = 0.0;
+    var caustic_receiver=false;var caustic_chain=false;
     let switching = mode >= 4u && (params.flags.x != 0u || (params.controls.x > 0.0 && params.controls.x < 1.0)) && (mode != 5u || params.controls.y < 1.0);
     let directional_mis = params.lights.z != 0u && switching;
     var rng = seed; var selection_rng = hash(seed ^ 0xa511e9b3u);
     var ro = ro_in; var rd = rd_in;
     var throughput = vec3<f32>(1.0); var radiance = vec3<f32>(0.0);
+    var medium_world=2u;var medium_ior=1.0;var medium_active=false;var medium_color=vec3<f32>(1.0);var eta_scale=1.0;
+    var camera_footprint=1.0;var path_spread=0.0;var incoming_pdf=0.0;
     var world = 0u;
     var primary_a: Hit; var primary_b: Hit; var cached_primary = false;
     if mode == 1u { world = 1u; }
@@ -448,8 +515,15 @@ fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
     var pending_switch = false;
     var switches = 0u; var bounces = 0u; var primary_normal = vec3<f32>(0.0);
     for (var bounce=0u; bounce<params.transport.y; bounce++) {
-        if pending_switch { switches++; }
+        if pending_switch && !guide_only { switches++; }
         pending_switch = false;
+        if world!=medium_world {
+            medium_world=world;medium_ior=1.0;medium_active=false;medium_color=vec3<f32>(1.0);
+            if (params.lights.w&(1u<<world))!=0u {
+                let boundary=glass_boundary(world,ro,rd);
+                if boundary.t<1e29 && boundary.front<0.5 {medium_ior=boundary.metal-2.0;medium_active=true;medium_color=boundary.color;}
+            }
+        }
         var hit: Hit;
         if bounce == 0u && cached_primary {
             if world == 0u { hit = primary_a; } else { hit = primary_b; }
@@ -457,27 +531,102 @@ fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
         if hit.t > 1e29 {
             radiance += throughput*vec3<f32>(0.045,0.055,0.075); break;
         }
-        bounces++;
+        if hit.metal>=2.0 && hit.front<0.5 {medium_ior=hit.metal-2.0;medium_active=true;medium_color=hit.color;}
+        if medium_active {
+            let absorption=pow(clamp(medium_color,vec3<f32>(0.0),vec3<f32>(1.0)),vec3<f32>(hit.t));
+            throughput*=absorption;if !guide_found {guide_weight*=absorption;}
+        }
+        if !guide_found && hit.metal<=0.5 {
+            guide_normal=hit.normal;guide_albedo=clamp(guide_weight*hit.color,vec3<f32>(0.0),vec3<f32>(1.0));guide_found=true;
+        }
+        if !guide_only {bounces++;}
+        if NRC_ENABLED {
+            let cosine=max(1e-5,abs(dot(hit.normal,rd)));
+            if bounce==0u {camera_footprint=hit.t*hit.t/(4.0*PI*cosine);}
+            else if incoming_pdf>1e-8 {path_spread+=hit.t/sqrt(incoming_pdf*cosine);}
+        }
+        if guide_only && guide_found {break;}
         if bounce == 0u { primary_normal = hit.normal*0.5+0.5; }
         var emission_weight = 1.0;
         if previous_pdf > 0.0 && hit.light_pdf > 0.0 { emission_weight = power_weight(previous_pdf,hit.light_pdf); }
-        radiance += throughput*hit.emission*emission_weight;
-        if max(hit.color.x,max(hit.color.y,hit.color.z)) == 0.0 { break; }
+        // Light tracing owns D S+ L paths; the camera still owns the sky,
+        // direct lights, all-delta camera paths, and every diffuse continuation.
+        if !(CAUSTICS_ENABLED && caustic_receiver && caustic_chain && hit.light_pdf>0.0) {
+            radiance += throughput*hit.emission*emission_weight;
+        }
+        if hit.metal<2.0 && max(hit.color.x,max(hit.color.y,hit.color.z)) == 0.0 { break; }
         let position = ro+hit.t*rd;
+        if CAUSTICS_ENABLED && hit.metal<=0.5 && bounce+1u<params.transport.y {
+            radiance+=throughput*caustic_estimate(world,position,hit.normal,hit.color,bounce,rd_in);
+            caustic_receiver=true;caustic_chain=false;
+        } else if CAUSTICS_ENABLED && hit.metal>0.5 && caustic_receiver {caustic_chain=true;}
+        if NRC_ENABLED && hit.metal<=0.5 && bounce+1u<params.transport.y {
+            let sample=NeuralSample(vec4<f32>(position+hit.normal*0.002,f32(world)),vec4<f32>(hit.normal,f32(params.transport.y-bounce-1u)),vec4<f32>(hit.color,0.0),vec4<f32>(0.0));
+            let eligible=select(bounce>=params.neural.y,bounce>0u && path_spread*path_spread>0.01*camera_footprint,params.neural.y==0u);
+            if NRC_TEACHER && neural_teacher {
+                if NRC_BOOTSTRAP && params.neural.w!=0u && !neural_uncached_anchor && neural_ready() && eligible {
+                    // A second spread event closes the training suffix. The
+                    // frozen training model predicts only scattering at this vertex;
+                    // its local emission was already added above, exactly once.
+                    if training_suffix {
+                        if NRC_TEACHER_QUEUED {
+                            var query=sample;query.label.w=1.0;
+                            frame_store.neural.teacher_queries[neural_record_base/4u]=query;
+                            training_terminal_scale=throughput*hit.color;
+                        }else {radiance+=throughput*hit.color*neural_predict(sample);}
+                        training_bootstrapped=true;break;
+                    }
+                    training_suffix=true;path_spread=0.0;
+                }
+                // The terminal query is deliberately excluded from supervision:
+                // only preceding vertices learn from its transported prediction.
+                if training_count<4u {
+                    frame_store.neural.samples[neural_record_base+training_count]=sample;
+                    training_prefix[training_count]=radiance;training_scale[training_count]=throughput*hit.color;training_count++;
+                }
+            }
+            if !NRC_TEACHER && params.neural.x!=0u && eligible && neural_ready() {
+                if NRC_COOPERATIVE || NRC_QUEUED {neural_pending=true;neural_pending_sample=sample;neural_pending_scale=throughput*hit.color;}
+                else {radiance+=throughput*hit.color*neural_predict(sample);}
+                break;
+            }
+        }
+
         previous_pdf = 0.0;
-        if hit.metal > 0.5 { rd = reflect(rd,hit.normal); }
-        else { rd = cosine_direction(hit.normal,&rng); }
-        // Lambertian: f*cos/pdf = (albedo/pi)*cos/(cos/pi) = albedo.
-        throughput *= hit.color;
-        ro = position+hit.normal*0.002;
-        if bounce >= 3u {
-            let survival = clamp(max(throughput.x,max(throughput.y,throughput.z)),0.05,0.95);
-            if random(&rng) >= survival { break; }
-            throughput /= survival;
+        var transmitted=false;
+        if hit.metal>=2.0 {
+            let eta_i=select(hit.metal-2.0,medium_ior,hit.front>0.5);
+            let eta_t=select(1.0,hit.metal-2.0,hit.front>0.5);
+            let cosine=clamp(-dot(rd,hit.normal),0.0,1.0);
+            let fresnel=dielectric_fresnel(cosine,eta_i,eta_t);
+            if random(&rng)<fresnel {rd=reflect(rd,hit.normal);}
+            else {
+                let eta=eta_i/eta_t;
+                rd=normalize(eta*rd+(eta*cosine-sqrt(max(0.0,1.0-eta*eta*(1.0-cosine*cosine))))*hit.normal);
+                throughput*=eta*eta;eta_scale=min(1e20,eta_scale/(eta*eta));
+                medium_ior=eta_t;medium_active=hit.front>0.5;medium_color=select(vec3<f32>(1.0),hit.color,hit.front>0.5);
+                transmitted=true;
+            }
+        }else {
+            if hit.metal>0.5 {rd=reflect(rd,hit.normal);}else {rd=cosine_direction(hit.normal,&rng);}
+            throughput*=hit.color;
+            if !guide_found {guide_weight*=hit.color;}
+        }
+        incoming_pdf=select(max(0.0,dot(hit.normal,rd))/PI,0.0,hit.metal>0.5);
+        ro=position+select(0.002,-0.002,transmitted)*hit.normal;
+        if bounce >= 3u && !guide_only {
+            let survival = clamp(max(throughput.x,max(throughput.y,throughput.z))*eta_scale,0.05,0.95);
+            if random(&rng) >= survival {
+                if guide_found {break;}
+                // Preserve the terminated radiance and statistics, but finish
+                // the delta guide path without roulette. This prevents dark
+                // guide holes in multi-interface glass at low sample counts.
+                guide_only=true;throughput=vec3<f32>(0.0);
+            }else {throughput /= survival;}
         }
         // NEE and continuation condition on the SAME next segment world. The
         // transition probability is part of the transport process, not a PDF
-        // to divide out. Selection happens after roulette, as in the reference.
+        // to divide channel. Selection happens after roulette, as in the reference.
         if bounce+1u >= params.transport.y { break; }
         if mode >= 4u {
             let previous = world;
@@ -498,6 +647,7 @@ fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
                     let cosine_pdf = max(0.0,dot(hit.normal,rd))/PI;
                     if cosine_pdf <= 0.0 { break; }
                     let mixture_pdf = 0.5*(cosine_pdf+light_direction_pdf(world,ro,rd));
+                    incoming_pdf=mixture_pdf;
                     throughput *= cosine_pdf/mixture_pdf;
                 }
             } else {
@@ -506,7 +656,20 @@ fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
             }
         }
     }
-    return Result(radiance,vec3<f32>(select(0.0,1.0,primary==0u),f32(switches),f32(bounces)),primary_normal);
+    if NRC_ENABLED && NRC_TEACHER && neural_teacher {
+        for (var i=0u;i<training_count;i++) {
+            let scale=training_scale[i];
+            let label=max(vec3<f32>(0.0),(radiance-training_prefix[i])/max(scale,vec3<f32>(1e-6)));
+            let valid=select(0.0,1.0,all(scale>vec3<f32>(1e-6)) && all(label<vec3<f32>(1e8)));
+            frame_store.neural.samples[neural_record_base+i].label=vec4<f32>(label,valid);
+            frame_store.neural.samples[neural_record_base+i].albedo.w=select(select(0.0,1.0,training_bootstrapped),2.0,neural_uncached_anchor);
+            if NRC_TEACHER_QUEUED && training_bootstrapped {
+                frame_store.neural.bootstrap_scales[neural_record_base+i]=vec4<f32>(training_terminal_scale/max(scale,vec3<f32>(1e-6)),0.0);
+            }
+        }
+    }
+    if !guide_found {guide_albedo=clamp(guide_weight,vec3<f32>(0.0),vec3<f32>(1.0));}
+    return Result(radiance,vec3<f32>(select(0.0,1.0,primary==0u),f32(switches),f32(bounces)),primary_normal,guide_normal,guide_albedo);
 }
 fn linear_pixel(pixel: Pixel, count: f32) -> vec3<f32> {
     if params.transport.x == 2u { return mix(pixel.b.xyz,pixel.a.xyz,params.controls.x)/count; }
@@ -526,43 +689,93 @@ fn guide_frame(id: vec3<u32>, color: vec3<f32>, count: f32) -> Frame {
     }
     return frame;
 }
-@compute @workgroup_size(8,8)
-fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= params.size.x || id.y >= params.size.y { return; }
-    let index = id.y*params.size.x+id.x;
-    var pixel: Pixel;
-    if params.size.w > 0u { pixel = pixels[index]; }
-    var fresh_a=vec3<f32>(0.0); var fresh_b=vec3<f32>(0.0);
-    let pixel_seed = index ^ hash(params.transport.z);
-    for (var sample=0u; sample<params.size.z; sample++) {
-        sequence_sample = params.size.w+sample;
-        sequence_scramble = hash(pixel_seed ^ 0xe7037ed1u);
-        sequence_active = params.lights.z != 0u;
-        let seed = hash(pixel_seed ^ hash(params.size.w+sample));
-        var camera_rng = hash(seed ^ 0x63d83595u);
-        let uv = (vec2<f32>(id.xy)+vec2<f32>(random(&camera_rng),random(&camera_rng)))/vec2<f32>(params.size.xy);
-        let direction = normalize(params.forward.xyz+(2.0*uv.x-1.0)*params.right.xyz+(1.0-2.0*uv.y)*params.up.xyz);
-        if ACTIVE_MODE == 2u {
-            let a = trace(params.eye.xyz,direction,seed,0u);
-            let b = trace(params.eye.xyz,direction,seed,1u);
-            if DENOISE_INPUT {fresh_a+=a.radiance;fresh_b+=b.radiance;}
-            pixel.a += vec4<f32>(a.radiance,0.0); pixel.b += vec4<f32>(b.radiance,0.0);
-            pixel.stats_a += vec4<f32>(a.stats,0.0); pixel.stats_b += vec4<f32>(b.stats,0.0);
-            pixel.normals_a += vec4<f32>(a.normal,0.0); pixel.normals_b += vec4<f32>(b.normal,0.0);
-        } else {
-            let a = trace(params.eye.xyz,direction,seed,ACTIVE_MODE);
-            if DENOISE_INPUT {fresh_a+=a.radiance;}
-            pixel.a += vec4<f32>(a.radiance,0.0); pixel.stats_a += vec4<f32>(a.stats,0.0); pixel.normals_a += vec4<f32>(a.normal,0.0);
+fn accumulate_pixel(id:vec3<u32>,lane:u32) {
+    let live=id.x<params.size.x && id.y<params.size.y;
+    if !live && !NRC_COOPERATIVE {return;}
+    let index=id.y*params.size.x+id.x;
+    // Keep statistics in storage, not live in registers across ray traversal.
+    // A full Pixel contains hundreds of bytes and would spill private memory.
+    if live && params.size.w==0u && !ADAPTIVE_TRACE {pixels[index]=Pixel();}
+    var sum_a=vec3<f32>(0.0);var sum_b=sum_a;var stats_a=sum_a;var stats_b=sum_a;var normals_a=sum_a;var normals_b=sum_a;
+    if live && (params.size.w>0u || ADAPTIVE_TRACE) {
+        sum_a=pixels[index].a.xyz;stats_a=pixels[index].stats_a.xyz;normals_a=pixels[index].normals_a.xyz;
+        if ACTIVE_MODE==2u {sum_b=pixels[index].b.xyz;stats_b=pixels[index].stats_b.xyz;normals_b=pixels[index].normals_b.xyz;}
+    }
+    if NRC_QUEUED && live {neural_clear_queries(index);}
+    var fresh_a=vec3<f32>(0.0);var fresh_b=vec3<f32>(0.0);
+    let control=ADAPTIVE_TRACE && params.size.w>=u32(params.reconstruction.z);
+    let predictor_a=select(vec3<f32>(0.0),pixels[index].moment_a.xyz,control);
+    let predictor_b=select(vec3<f32>(0.0),pixels[index].moment_b.xyz,control);
+    let old_stats_a=select(vec3<f32>(0.0),stats_a/f32(params.size.w+1u),control);
+    let old_stats_b=select(vec3<f32>(0.0),stats_b/f32(params.size.w+1u),control);
+    let old_normal_a=select(vec3<f32>(0.0),normals_a/f32(params.size.w+1u),control);
+    let old_normal_b=select(vec3<f32>(0.0),normals_b/f32(params.size.w+1u),control);
+    var samples=params.size.z;var scale=1.0;
+    if ADAPTIVE_TRACE {
+        // Bounded priorities request at most six rays. Guard corrupt metadata
+        // separately from the allocation law so it cannot hang a GPU kernel.
+        samples=min(pixels[index].schedule.x,8u);if pixels[index].schedule.x>8u {pixels[index].counts.z++;}
+        scale=1.0/bitcast<f32>(pixels[index].schedule.y);
+    }
+    let first_sample=select(params.size.w,pixels[index].counts.x,ADAPTIVE_TRACE);
+    let pixel_seed=index^hash(params.transport.z);
+    for(var sample=0u;sample<samples;sample++) {
+        sequence_sample=first_sample+sample;sequence_scramble=hash(pixel_seed^0xe7037ed1u);
+        // An adaptive queue needs fresh world choices independent of its past
+        // observations; uniform paths retain their stratified world sequence.
+        sequence_active=params.lights.z!=0u && !ADAPTIVE_TRACE;
+        let seed=hash(pixel_seed^hash(first_sample+sample));
+        var camera_rng=hash(seed^0x63d83595u);
+        let uv=(vec2<f32>(id.xy)+vec2<f32>(random(&camera_rng),random(&camera_rng)))/vec2<f32>(params.size.xy);
+        let direction=normalize(params.forward.xyz+(2.0*uv.x-1.0)*params.right.xyz+(1.0-2.0*uv.y)*params.up.xyz);
+        neural_pending=false;var a:Result;
+        if live {a=trace(params.eye.xyz,direction,seed,select(ACTIVE_MODE,0u,ACTIVE_MODE==2u));}
+        if NRC_QUEUED && neural_pending {
+            neural_pending_sample.albedo.w=adaptive_luma(a.radiance);
+            neural_pending_sample.label=vec4<f32>(neural_pending_scale,1.0);
+            neural_enqueue(index*select(1u,2u,ACTIVE_MODE==2u),neural_pending_sample);
+        }
+        if NRC_COOPERATIVE {let prediction=neural_resolve_matrix(lane);if neural_pending {a.radiance+=neural_pending_scale*prediction;}}
+        if live {observe_camera(index,a,0u);}
+        if !ADAPTIVE_TRACE && live {
+            let visible=caustic_visible(index,select(0u,1u,ACTIVE_MODE==1u));
+            pixels[index].light_a+=vec4<f32>(visible,1.0);a.radiance+=visible;
+        }
+        if DENOISE_INPUT {fresh_a+=a.radiance;}
+        sum_a+=(a.radiance-predictor_a)*scale;
+        stats_a+=(a.stats-old_stats_a)*scale;
+        normals_a+=(a.normal-old_normal_a)*scale;
+        if ACTIVE_MODE==2u {
+            neural_pending=false;var b:Result;if live {b=trace(params.eye.xyz,direction,seed,1u);}
+            if NRC_QUEUED && neural_pending {
+                neural_pending_sample.albedo.w=adaptive_luma(b.radiance);
+                neural_pending_sample.label=vec4<f32>(neural_pending_scale,1.0);neural_enqueue(index*2u+1u,neural_pending_sample);
+            }
+            if NRC_COOPERATIVE {let prediction=neural_resolve_matrix(lane);if neural_pending {b.radiance+=neural_pending_scale*prediction;}}
+            if live {observe_camera(index,b,1u);}
+            if !ADAPTIVE_TRACE && live {let visible=caustic_visible(index,1u);pixels[index].light_b+=vec4<f32>(visible,1.0);b.radiance+=visible;}
+            if DENOISE_INPUT {fresh_b+=b.radiance;}
+            sum_b+=(b.radiance-predictor_b)*scale;
+            stats_b+=(b.stats-old_stats_b)*scale;
+            normals_b+=(b.normal-old_normal_b)*scale;
         }
     }
-    pixels[index] = pixel;
+    if !live {return;}
+    pixels[index].a=vec4<f32>(sum_a,pixels[index].a.w);pixels[index].stats_a=vec4<f32>(stats_a,pixels[index].stats_a.w);pixels[index].normals_a=vec4<f32>(normals_a,pixels[index].normals_a.w);
+    if ACTIVE_MODE==2u {pixels[index].b=vec4<f32>(sum_b,pixels[index].b.w);pixels[index].stats_b=vec4<f32>(stats_b,pixels[index].stats_b.w);pixels[index].normals_b=vec4<f32>(normals_b,pixels[index].normals_b.w);}
     if DENOISE_INPUT {
         var fresh=select(fresh_a,mix(fresh_b,fresh_a,params.controls.x),ACTIVE_MODE==2u);
-        let count=f32(params.size.z);
-        fresh/=max(count,1.0);
-        frames[index]=guide_frame(id,fresh,count);
+        let count=f32(params.size.z);fresh/=max(count,1.0);frame_store.frames[index]=guide_frame(id,fresh,count);
     }
-    if (u32(params.controls.w) & 8u) != 0u { display_pixel(id,pixel); }
+    if (u32(params.controls.w)&8u)!=0u {display_pixel(id,pixels[index]);}
+}
+@compute @workgroup_size(8,TRACE_GROUP_Y)
+fn accumulate(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_index) lane:u32) {accumulate_pixel(id,lane);}
+@compute @workgroup_size(64)
+fn accumulate_adaptive(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_index) lane:u32) {
+    if id.x>=u32(pixels[0].allocation.x) {return;}
+    let index=pixels[id.x].work.x;
+    accumulate_pixel(vec3<u32>(index%params.size.x,index/params.size.x,0u),lane);
 }
 fn srgb(linear: vec3<f32>) -> vec3<f32> {
     return select(1.055*pow(max(linear,vec3<f32>(0.0)),vec3<f32>(1.0/2.4))-0.055,12.92*linear,linear<=vec3<f32>(0.0031308));
@@ -576,13 +789,16 @@ fn display_estimate(id: vec3<u32>, pixel: Pixel, estimate: vec3<f32>) {
         normals = mix(pixel.normals_b.xyz,pixel.normals_a.xyz,params.controls.x)/count;
     }
     if params.transport.w == 0u {
-        color = estimate;
+        color = max(vec3<f32>(0.0),estimate);
         color *= exp2(params.controls.z);
         color = srgb(color/(vec3<f32>(1.0)+color)); // Reinhard, then exact sRGB encoding.
     } else if params.transport.w == 1u { color = mix(vec3<f32>(0.1,0.6,1.0),vec3<f32>(1.0,0.25,0.08),stats.x); }
     else if params.transport.w == 2u { color = vec3<f32>(stats.y/f32(max(1u,params.transport.y-1u)),0.1,1.0-stats.y/f32(max(1u,params.transport.y-1u))); }
     else if params.transport.w == 3u { color = vec3<f32>(stats.z/f32(params.transport.y)); }
-    else { color = normals; }
+    else if params.transport.w==5u {
+        let ratio=f32(pixel.counts.x)/count;
+        color=mix(vec3<f32>(0.04,0.2,0.7),vec3<f32>(1.0,0.25,0.03),clamp(ratio/2.0,0.0,1.0));
+    }else { color = normals; }
     textureStore(output,vec2<i32>(id.xy),vec4<f32>(color,1.0));
 }
 

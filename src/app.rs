@@ -1,7 +1,7 @@
 use crate::{
     gpu::{self, Renderer},
-    scene::WorldPreset,
-    settings::{Mode, Settings, View},
+    scene::{GlassPreset, WorldPreset},
+    settings::{DenoiserKind, Mode, SamplingMode, Settings, View},
 };
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -10,10 +10,7 @@ use std::{path::PathBuf, time::Instant};
 pub fn run(settings: Settings, width: u32, height: u32, smoke_frames: Option<u32>) -> Result<()> {
     let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     setup.instance_descriptor = gpu::instance_descriptor();
-    setup.device_descriptor = std::sync::Arc::new(|_| wgpu::DeviceDescriptor {
-        label: Some("Interactive multiworld GPU"),
-        ..Default::default()
-    });
+    setup.device_descriptor = std::sync::Arc::new(gpu::device_descriptor);
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
@@ -106,9 +103,36 @@ impl App {
                     });
             });
             ui.small(self.settings.worlds[slot].description());
+            if self.settings.worlds[slot].has_glass() {
+                egui::ComboBox::from_id_salt(("glass-preset", slot))
+                    .selected_text(self.settings.glass[slot].label())
+                    .show_ui(ui, |ui| {
+                        for glass in GlassPreset::ALL {
+                            ui.selectable_value(
+                                &mut self.settings.glass[slot],
+                                glass,
+                                glass.label(),
+                            );
+                        }
+                    });
+            }
         }
         if ui.button("Swap A ↔ B").clicked() {
             self.settings.worlds.swap(0, 1);
+            self.settings.glass.swap(0, 1);
+        }
+        if ui.button("Glass & caustics showcase").clicked() {
+            self.settings.worlds = [WorldPreset::GlassGallery, WorldPreset::CrystalGarden];
+            self.settings.glass = [GlassPreset::Assorted; 2];
+            self.settings.caustics = true;
+            self.settings.sampling = SamplingMode::Denoised;
+            self.settings.mode = Mode::WorldA;
+            self.settings.yaw = 0.6;
+            self.settings.pitch = 0.55;
+            self.settings.distance = 13.;
+            self.settings.depth = 20;
+            self.settings.exposure = 0.25;
+            self.settings.denoise = true;
         }
         ui.collapsing("Suggested pairings", |ui| {
             for (label, pair) in [
@@ -158,6 +182,49 @@ impl App {
         .on_hover_text(
             "Power-weighted lights, solid-angle sampling, and stratified world selection.",
         );
+        ui.checkbox(&mut self.settings.caustics, "Fast glass caustics (experimental)")
+            .on_hover_text("Aim light at glass. Sharp visible caustics; progressive photon gathering through glass.");
+        if self.settings.caustics {
+            if !self.settings.caustics_active() {
+                ui.small("Choose World A, World B or Image-space blend to use fast caustics.");
+            } else {
+                ui.small("Photon gathering improves over time. Neural caching is bypassed while this is active.");
+            }
+        }
+        ui.checkbox(
+            &mut self.settings.neural_cache,
+            "Neural radiance cache (experimental)",
+        )
+        .on_hover_text(
+            "Online GPU-trained MLP. Biased indirect lighting; compare with cache disabled.",
+        );
+        if self.settings.neural_cache {
+            ui.checkbox(
+                &mut self.settings.cache_self_training,
+                "Shorter training paths (experimental)",
+            )
+            .on_hover_text(
+                "Use learned lighting to shorten training rays. Keeps 1/16 fully traced; may trade accuracy for lower training cost.",
+            );
+            let mut automatic = self.settings.cache_bounce == 0;
+            if ui
+                .checkbox(&mut automatic, "Automatic path-spread termination")
+                .changed()
+            {
+                self.settings.cache_bounce = if automatic { 0 } else { 2 };
+            }
+            if !automatic {
+                ui.add(
+                    egui::Slider::new(&mut self.settings.cache_bounce, 1..=6)
+                        .text("First cache bounce"),
+                );
+            }
+            ui.small(format!(
+                "Fused GPU training · {} batches",
+                self.renderer.neural_training_batches()
+            ));
+            ui.small("Approximate indirect light. Reset clears the learned cache.");
+        }
         ui.checkbox(&mut self.settings.use_bvh, "BVH acceleration");
         if self.settings.use_bvh {
             ui.checkbox(
@@ -165,18 +232,60 @@ impl App {
                 "Automatic small-scene fallback",
             );
         }
-        ui.checkbox(
-            &mut self.settings.denoise,
-            "Temporal denoise (display only)",
-        );
+        ui.checkbox(&mut self.settings.denoise, "Denoise");
         if self.settings.denoise {
+            let previous_denoiser = self.settings.denoiser;
+            egui::ComboBox::from_label("Denoiser")
+                .selected_text(self.settings.denoiser.label())
+                .show_ui(ui, |ui| {
+                    for kind in DenoiserKind::ALL {
+                        ui.selectable_value(&mut self.settings.denoiser, kind, kind.label());
+                    }
+                });
+            if previous_denoiser != self.settings.denoiser
+                && self.settings.denoiser == DenoiserKind::Temporal
+                && self.settings.sampling == SamplingMode::Denoised
+            {
+                self.settings.sampling = SamplingMode::Variance;
+            }
+            if self.settings.denoiser == DenoiserKind::Oidn
+                && let Some(status) = self.renderer.denoising_status()
+            {
+                ui.small(status);
+            }
             ui.add(
                 egui::Slider::new(&mut self.settings.denoise_strength, 0.0..=1.0)
                     .text("Denoise strength"),
             );
-            ui.small("Dual-world history; raw samples stay available for comparison.");
+            ui.small("Raw samples stay available for comparison.");
         }
-        ui.add(egui::Slider::new(&mut self.settings.spp, 1..=16).text("Samples / frame"));
+        let old_sampling = self.settings.sampling;
+        egui::ComboBox::from_label("Sampling")
+            .selected_text(self.settings.sampling.label())
+            .show_ui(ui, |ui| {
+                for mode in SamplingMode::ALL {
+                    ui.selectable_value(&mut self.settings.sampling, mode, mode.label());
+                }
+            });
+        if self.settings.sampling != old_sampling
+            && self.settings.sampling == SamplingMode::Denoised
+        {
+            self.settings.denoise = true;
+            self.settings.denoiser = DenoiserKind::Oidn;
+        }
+        if self.settings.sampling != SamplingMode::Uniform {
+            ui.small("More paths for uncertain pixels; a fixed total ray budget.");
+            if self.settings.sampling == SamplingMode::Denoised && !self.settings.denoise {
+                ui.small("OIDN still guides adaptive sampling.");
+            }
+        }
+        ui.add(egui::Slider::new(&mut self.settings.spp, 1..=16).text(
+            if self.settings.sampling == SamplingMode::Uniform {
+                "Samples / frame"
+            } else {
+                "Average samples / frame"
+            },
+        ));
         ui.add(egui::Slider::new(&mut self.settings.depth, 1..=32).text("Max bounces"));
         ui.add(egui::Slider::new(&mut self.settings.exposure, -5.0..=5.0).text("Exposure (EV)"));
         ui.horizontal(|ui| {
@@ -259,8 +368,16 @@ impl App {
         });
         ui.separator();
         ui.monospace(format!(
-            "{:.1} FPS · {} spp\n{} × {}",
-            self.fps, self.renderer.samples, self.renderer.width, self.renderer.height
+            "{:.1} FPS · {} {}\n{} × {}",
+            self.fps,
+            self.renderer.samples,
+            if self.settings.sampling == SamplingMode::Uniform {
+                "spp"
+            } else {
+                "avg spp"
+            },
+            self.renderer.width,
+            self.renderer.height
         ));
         let info = self.state.adapter.get_info();
         ui.small(format!("{} / {:?}", info.name, info.backend));

@@ -134,3 +134,23 @@ pub fn ellipsoid(origin: Vec3, direction: Vec3, center: Vec3, radii: Vec3) -> Op
         normal: ((origin + hit.t * direction - center) / (radii * radii)).normalize(),
     })
 }
+
+/// Two-sided triangle reference; geometric winding is retained for dielectrics.
+pub fn triangle(origin: Vec3, direction: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<Hit> {
+    let e1 = b - a;
+    let e2 = c - a;
+    let p = direction.cross(e2);
+    let determinant = e1.dot(p);
+    if determinant.abs() < 1e-9 {
+        return None;
+    }
+    let s = origin - a;
+    let u = s.dot(p) / determinant;
+    let q = s.cross(e1);
+    let v = direction.dot(q) / determinant;
+    let t = e2.dot(q) / determinant;
+    (u >= -1e-6 && v >= -1e-6 && u + v <= 1.000001 && t > EPSILON).then(|| Hit {
+        t,
+        normal: e1.cross(e2).normalize(),
+    })
+}

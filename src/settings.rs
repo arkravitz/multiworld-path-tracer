@@ -1,4 +1,4 @@
-use crate::scene::WorldPreset;
+use crate::scene::{GlassPreset, WorldPreset};
 use clap::ValueEnum;
 use glam::Vec3;
 
@@ -50,14 +50,16 @@ pub enum View {
     Switches,
     Bounces,
     Normals,
+    Samples,
 }
 impl View {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Radiance,
         Self::PrimaryWorld,
         Self::Switches,
         Self::Bounces,
         Self::Normals,
+        Self::Samples,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -66,6 +68,39 @@ impl View {
             Self::Switches => "World switches",
             Self::Bounces => "Bounce count",
             Self::Normals => "Surface normals",
+            Self::Samples => "Ray allocation",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[repr(u32)]
+pub enum DenoiserKind {
+    Oidn,
+    Temporal,
+}
+impl DenoiserKind {
+    pub const ALL: [Self; 2] = [Self::Oidn, Self::Temporal];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Oidn => "OIDN · high quality",
+            Self::Temporal => "Temporal · legacy",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[repr(u32)]
+pub enum SamplingMode {
+    Uniform,
+    Variance,
+    Denoised,
+}
+impl SamplingMode {
+    pub const ALL: [Self; 3] = [Self::Uniform, Self::Variance, Self::Denoised];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Uniform => "Uniform",
+            Self::Variance => "Adaptive · noise",
+            Self::Denoised => "Adaptive · denoised error",
         }
     }
 }
@@ -73,10 +108,17 @@ impl View {
 pub struct Settings {
     pub mode: Mode,
     pub worlds: [WorldPreset; 2],
+    pub glass: [GlassPreset; 2],
     pub use_bvh: bool,
     pub light_sampling: bool,
     pub adaptive_bvh: bool,
     pub denoise: bool,
+    pub denoiser: DenoiserKind,
+    pub sampling: SamplingMode,
+    pub neural_cache: bool,
+    pub caustics: bool,
+    pub cache_bounce: u32,
+    pub cache_self_training: bool,
     pub denoise_strength: f32,
     pub p: f32,
     pub persistence: f32,
@@ -100,10 +142,17 @@ impl Default for Settings {
         Self {
             mode: Mode::PerBounce,
             worlds: [WorldPreset::WarmSpheres, WorldPreset::CoolBoxes],
+            glass: [GlassPreset::Assorted; 2],
             use_bvh: true,
             light_sampling: true,
             adaptive_bvh: true,
             denoise: false,
+            denoiser: DenoiserKind::Oidn,
+            sampling: SamplingMode::Uniform,
+            neural_cache: false,
+            caustics: false,
+            cache_bounce: 0,
+            cache_self_training: false,
             denoise_strength: 0.8,
             p: 0.5,
             persistence: 0.8,
@@ -125,10 +174,16 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    /// Adjoint world-switching is deliberately outside the photon estimator.
+    pub fn caustics_active(&self) -> bool {
+        self.caustics && matches!(self.mode, Mode::WorldA | Mode::WorldB | Mode::Blend)
+    }
     /// Display changes, batch size, and blend weight do not invalidate linear sums.
     pub fn invalidates(&self, old: &Self) -> bool {
         let mut a = self.clone();
         let mut b = old.clone();
+        a.denoiser = DenoiserKind::Oidn;
+        b.denoiser = DenoiserKind::Oidn;
         a.denoise = false;
         b.denoise = false;
         a.denoise_strength = 0.;

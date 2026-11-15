@@ -61,9 +61,30 @@ impl Bvh {
             );
             let shape = object.extent_shape[3];
             ensure!(
-                shape == 0.0 || shape == 1.0 || shape == 2.0 || shape == 3.0 || shape == 4.0,
+                shape == 0.0
+                    || shape == 1.0
+                    || shape == 2.0
+                    || shape == 3.0
+                    || shape == 4.0
+                    || shape == 5.0,
                 "Object {id} has an unsupported shape"
             );
+            if object.color_material[3] >= 2. {
+                ensure!(
+                    (3.0..=5.0).contains(&object.color_material[3]),
+                    "Dielectric {id} must have IOR in [1,3]"
+                );
+                ensure!(
+                    object.color_material[..3]
+                        .iter()
+                        .all(|v| (0.0..=1.0).contains(v)),
+                    "Dielectric {id} transmittance must be in [0,1]"
+                );
+                ensure!(
+                    shape != 2.0,
+                    "Dielectric {id} needs a closed volume, not an infinite plane"
+                );
+            }
             if shape == 2.0 {
                 nodes.push(Node {
                     low: [0.; 3],
@@ -74,6 +95,28 @@ impl Bvh {
                 continue;
             }
             let center = Vec3::from_slice(&object.center_radius[..3]);
+            if shape == 5.0 {
+                let b = center + Vec3::from_slice(&object.extent_shape[..3]);
+                let c = center + Vec3::from_slice(&object.emission[..3]);
+                ensure!(
+                    (b - center).cross(c - center).length_squared() > 1e-16
+                        && (b - center).cross(c - center).length_squared().is_finite(),
+                    "Triangle {id} is degenerate"
+                );
+                let low = center.min(b).min(c);
+                let high = center.max(b).max(c);
+                ensure!(
+                    low.is_finite() && high.is_finite() && (high - low).is_finite(),
+                    "Triangle {id} bounds overflow f32"
+                );
+                let padding = (low.abs().max(high.abs()) + Vec3::ONE) * (8. * f32::EPSILON);
+                primitives.push(Primitive {
+                    id: id as u32,
+                    low: low - padding,
+                    high: high + padding,
+                });
+                continue;
+            }
             let extent = if shape == 0.0 {
                 ensure!(
                     object.center_radius[3] > 0.0,

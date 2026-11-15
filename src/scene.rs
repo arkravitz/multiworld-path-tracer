@@ -1,6 +1,9 @@
 use bytemuck::{Pod, Zeroable};
 use clap::ValueEnum;
+mod glass;
+pub mod mesh;
 mod presets;
+pub use glass::GlassPreset;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum WorldPreset {
@@ -10,9 +13,13 @@ pub enum WorldPreset {
     NeonDistrict,
     LunarObservatory,
     BioluminescentGrove,
+    GlassGallery,
+    CrystalGarden,
 }
 impl WorldPreset {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
+        Self::GlassGallery,
+        Self::CrystalGarden,
         Self::SunkenTemple,
         Self::BioluminescentGrove,
         Self::LunarObservatory,
@@ -20,8 +27,13 @@ impl WorldPreset {
         Self::WarmSpheres,
         Self::CoolBoxes,
     ];
+    pub fn has_glass(self) -> bool {
+        matches!(self, Self::GlassGallery | Self::CrystalGarden)
+    }
     pub fn label(self) -> &'static str {
         match self {
+            Self::GlassGallery => "Tessellated teapot · glass gallery",
+            Self::CrystalGarden => "Suzanne · crystal garden",
             Self::WarmSpheres => "Warm spheres · original",
             Self::CoolBoxes => "Cool boxes · original",
             Self::SunkenTemple => "Sunken temple",
@@ -32,6 +44,12 @@ impl WorldPreset {
     }
     pub fn description(self) -> &'static str {
         match self {
+            Self::GlassGallery => {
+                "The Utah Teapot in faceted glass, with focused light on pale stone."
+            }
+            Self::CrystalGarden => {
+                "A faceted Suzanne sculpture, colored glass lenses and luminous arches."
+            }
             Self::WarmSpheres => "Warm diffuse spheres and gold mirrors.",
             Self::CoolBoxes => "Cool blue boxes and silver mirrors.",
             Self::SunkenTemple => "Sandstone arcades, gold relics and amber lanterns.",
@@ -43,6 +61,8 @@ impl WorldPreset {
 }
 pub fn selected_worlds(seed: u32, presets: [WorldPreset; 2]) -> [Vec<Object>; 2] {
     presets.map(|preset| match preset {
+        WorldPreset::GlassGallery => presets::glass_gallery(seed),
+        WorldPreset::CrystalGarden => presets::crystal_garden(seed),
         WorldPreset::WarmSpheres => worlds(seed)[0].clone(),
         WorldPreset::CoolBoxes => worlds(seed)[1].clone(),
         WorldPreset::SunkenTemple => presets::temple(seed),
@@ -52,16 +72,36 @@ pub fn selected_worlds(seed: u32, presets: [WorldPreset; 2]) -> [Vec<Object>; 2]
     })
 }
 
+pub fn selected_worlds_with_glass(
+    seed: u32,
+    presets: [WorldPreset; 2],
+    glass: [GlassPreset; 2],
+) -> [Vec<Object>; 2] {
+    let mut worlds = selected_worlds(seed, presets);
+    for (world, kind) in worlds.iter_mut().zip(glass) {
+        if kind != GlassPreset::Assorted {
+            for object in world {
+                if object.color_material[3] >= 2. {
+                    object.color_material = kind.material();
+                }
+            }
+        }
+    }
+    worlds
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct Object {
     pub center_radius: [f32; 4],
     /// Half extents and shape: 0 sphere, 1 box, 2 horizontal plane,
-    /// 3 capsule (xyz is midpoint-to-end vector), 4 ellipsoid (xyz is radii).
+    /// 3 capsule (xyz is midpoint-to-end vector), 4 ellipsoid (xyz is radii),
+    /// 5 triangle (center.xyz=vertex0, extent.xyz=edge1, emission.xyz=edge2).
     pub extent_shape: [f32; 4],
     /// RGB reflectance and material: 0 Lambertian, 1 perfect mirror.
+    /// Dielectrics encode 2+IOR in w and unit-distance RGB transmittance in xyz.
     pub color_material: [f32; 4],
-    /// RGB emitted radiance; the fourth component is reserved for GPU light metadata.
+    /// RGB emitted radiance (triangle: edge2, never an emitter); w is light metadata.
     pub emission: [f32; 4],
 }
 /// Specified integer PRNG; scene generation is stable across Rust versions.

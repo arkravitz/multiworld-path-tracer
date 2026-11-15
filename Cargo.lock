@@ -1349,6 +1349,8 @@ dependencies = [
  "clap",
  "eframe",
  "glam",
+ "libloading",
+ "naga",
  "png",
  "pollster 0.4.0",
  "wgpu",

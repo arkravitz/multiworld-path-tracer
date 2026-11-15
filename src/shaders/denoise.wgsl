@@ -49,13 +49,13 @@ fn projected_history(id:vec3<u32>,frame:Frame) -> vec3<f32> {
 }
 fn current_estimate(index:u32,from_raw:bool) -> vec3<f32> {
     if from_raw {return linear_pixel(pixels[index],f32(max(1u,params.size.w+params.size.z)));}
-    return frames[index].sample.xyz;
+    return frame_store.frames[index].sample.xyz;
 }
 @compute @workgroup_size(8,8)
 fn denoise(@builtin(global_invocation_id) id:vec3<u32>) {
     if id.x>=params.size.x || id.y>=params.size.y {return;}
     let index=id.y*params.size.x+id.x;
-    var current=frames[index];
+    var current=frame_store.frames[index];
     let total=params.size.w+params.size.z;
     if total==0u {
         current.sample=vec4<f32>(0.0);history_next[index]=current;
@@ -80,14 +80,14 @@ fn denoise(@builtin(global_invocation_id) id:vec3<u32>) {
     }
     // No history (toggle/reset/headless final image): start with the complete raw
     // progressive estimate. Otherwise consume ONLY this dispatch's new samples.
-    let from_raw=!valid || params.size.z==0u;
+    let from_raw=!valid || params.size.z==0u || params.reconstruction.y>0.5;
     let center=current_estimate(index,from_raw);
     var sum=vec3<f32>(0.0);var square=sum;var weight=0.0;
     for (var dy=-1;dy<=1;dy++) {for (var dx=-1;dx<=1;dx++) {
         let q=vec2<i32>(id.xy)+vec2<i32>(dx,dy);
         if any(q<vec2<i32>(0)) || any(q>=vec2<i32>(params.size.xy)) {continue;}
         let j=u32(q.y)*params.size.x+u32(q.x);
-        if !compatible(current,frames[j],false) {continue;}
+        if !compatible(current,frame_store.frames[j],false) {continue;}
         let w=select(1.0,2.0,dx==0 && dy==0);
         let value=current_estimate(j,from_raw);
         sum+=w*value;square+=w*value*value;weight+=w;

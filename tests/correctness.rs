@@ -155,3 +155,43 @@ fn ellipsoid_flattened_cap_and_inside_exit() {
     assert!((h.t - 2.).abs() < 1e-5);
     assert!(h.normal.abs_diff_eq(Vec3::X, 1e-5));
 }
+
+#[test]
+fn neural_controls_reset_estimators_while_camera_preserves_model_context() {
+    let old = Settings::default();
+    assert!(!old.neural_cache);
+    let mut cached = old.clone();
+    cached.neural_cache = true;
+    assert!(cached.invalidates(&old));
+    assert!(!cached.history_compatible(&old));
+    let mut earlier = cached.clone();
+    earlier.cache_bounce = 1;
+    assert!(earlier.invalidates(&cached));
+    assert!(!earlier.history_compatible(&cached));
+    let mut self_training = cached.clone();
+    self_training.cache_self_training = true;
+    assert!(self_training.invalidates(&cached));
+    assert!(!self_training.history_compatible(&cached));
+    let mut camera = cached.clone();
+    camera.yaw += 0.1;
+    assert!(camera.invalidates(&cached));
+    assert!(camera.history_compatible(&cached));
+}
+
+#[test]
+fn reconstruction_switches_preserve_raw_while_sampling_policy_resets_it() {
+    use multiworld_path_tracer::settings::{DenoiserKind, SamplingMode};
+    let old = Settings::default();
+    let mut s = old.clone();
+    s.denoise = true;
+    s.denoiser = DenoiserKind::Temporal;
+    s.denoise_strength = 0.3;
+    assert!(!s.invalidates(&old));
+    s.denoiser = DenoiserKind::Oidn;
+    assert!(!s.invalidates(&old));
+    s.sampling = SamplingMode::Variance;
+    assert!(s.invalidates(&old));
+    let variance = s.clone();
+    s.sampling = SamplingMode::Denoised;
+    assert!(s.invalidates(&variance));
+}
