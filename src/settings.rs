@@ -110,13 +110,26 @@ pub struct Settings {
     pub worlds: [WorldPreset; 2],
     pub glass: [GlassPreset; 2],
     pub use_bvh: bool,
+    pub hardware_ray_tracing: bool,
     pub light_sampling: bool,
     pub adaptive_bvh: bool,
     pub denoise: bool,
     pub denoiser: DenoiserKind,
     pub sampling: SamplingMode,
     pub neural_cache: bool,
+    pub tensor_neural: bool,
     pub caustics: bool,
+    pub photon_guiding: bool,
+    pub photon_reuse: bool,
+    pub manifold_guiding: bool,
+    /// Zero selects the image-size-dependent budget; otherwise 256..=32768.
+    pub photon_budget: u32,
+    pub photon_nrc: bool,
+    pub photon_nrc_photons: u32,
+    pub photon_nrc_queries: u32,
+    pub photon_nrc_hash_log2: u32,
+    pub photon_nrc_global_radius: f32,
+    pub photon_nrc_caustic_radius: f32,
     pub cache_bounce: u32,
     pub cache_self_training: bool,
     pub denoise_strength: f32,
@@ -144,13 +157,25 @@ impl Default for Settings {
             worlds: [WorldPreset::WarmSpheres, WorldPreset::CoolBoxes],
             glass: [GlassPreset::Assorted; 2],
             use_bvh: true,
+            hardware_ray_tracing: true,
             light_sampling: true,
             adaptive_bvh: true,
             denoise: false,
             denoiser: DenoiserKind::Oidn,
             sampling: SamplingMode::Uniform,
             neural_cache: false,
+            tensor_neural: true,
             caustics: false,
+            photon_guiding: false,
+            photon_reuse: false,
+            manifold_guiding: false,
+            photon_budget: 0,
+            photon_nrc: false,
+            photon_nrc_photons: 32768,
+            photon_nrc_queries: 2048,
+            photon_nrc_hash_log2: 14,
+            photon_nrc_global_radius: 0.25,
+            photon_nrc_caustic_radius: 0.08,
             cache_bounce: 0,
             cache_self_training: false,
             denoise_strength: 0.8,
@@ -174,6 +199,9 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn photon_nrc_active(&self) -> bool {
+        self.photon_nrc && matches!(self.mode, Mode::WorldA | Mode::WorldB | Mode::Blend)
+    }
     /// Adjoint world-switching is deliberately outside the photon estimator.
     pub fn caustics_active(&self) -> bool {
         self.caustics && matches!(self.mode, Mode::WorldA | Mode::WorldB | Mode::Blend)

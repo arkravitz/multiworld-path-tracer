@@ -8,13 +8,25 @@ struct Parameters {
     targets: [[f32; 4]; 32],
     layout: [u32; 4],
     shape: [f32; 4],
+    spheres: [[f32; 4]; 16],
+    learning: [u32; 4],
+    features: [u32; 4],
 }
 pub(super) struct Caustics {
     pub group: wgpu::BindGroup,
+    #[cfg(test)]
+    pub data: wgpu::Buffer,
+    #[cfg(test)]
+    pub diagnostic_offset: u64,
     offsets: [u32; 4],
     uniform: wgpu::Buffer,
+    learning: [u32; 4],
+    round: u32,
+    learn: wgpu::ComputePipeline,
+    focus: wgpu::ComputePipeline,
+    probabilities: wgpu::ComputePipeline,
     clear: wgpu::ComputePipeline,
-    emit: wgpu::ComputePipeline,
+    emit: [wgpu::ComputePipeline; 8],
     scan_buckets: wgpu::ComputePipeline,
     scan_blocks: wgpu::ComputePipeline,
     scatter: wgpu::ComputePipeline,
@@ -28,21 +40,24 @@ impl Caustics {
         base: &wgpu::BindGroupLayout,
         width: u32,
         height: u32,
+        trace_group_y: u32,
     ) -> Self {
-        // Small previews should not spend more work emitting photons than
-        // tracing camera pixels. Scale the budget and cap interactive memory.
-        let photons = (width * height / 4)
-            .max(1)
-            .next_power_of_two()
-            .clamp(4096, 32768);
+        // Fixed capacity permits changing the independent launch budget without
+        // recompiling pipelines. Only the requested lanes perform light tracing.
+        let photons = 32768;
         let buckets = photons;
         let records = buckets * 4 + 256;
-        let splats = records + photons * 2 * 13;
+        let splats = records + photons * 2 * 17;
         let offsets = [photons, buckets, records, splats];
+        let weights = splats + width * height * 6 + 8;
+        let stats = weights + 1024 * 2 + 64;
+        let focus = stats + 2048;
+        let reservoirs = focus + 16;
+        let learning = [weights, stats, focus, reservoirs];
         let data = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Caustic photons, hash heads and pixel splats"),
-            size: (u64::from(splats) + u64::from(width) * u64::from(height) * 6) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
+            size: u64::from(reservoirs + photons * 2 * 2 * 20) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -86,12 +101,13 @@ impl Caustics {
             include_str!("../shaders/nrc.wgsl"),
             include_str!("../shaders/nrc_scalar.wgsl"),
             include_str!("../shaders/caustics.wgsl"),
+            include_str!("../shaders/caustics_sampling.wgsl"),
             include_str!("../shaders/denoise.wgsl"),
         ]
         .join("\n");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Targeted caustic light paths"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
+            source: wgpu::ShaderSource::Wgsl(super::ray_query::shader(device, source).into()),
         });
         let pipeline = |entry: &'static str, mode: usize, guides: bool| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -101,7 +117,16 @@ impl Caustics {
                 entry_point: Some(entry),
                 compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &[
-                        ("ACTIVE_MODE", mode as f64),
+                        ("ACTIVE_MODE", mode.min(2) as f64),
+                        ("TRACE_GROUP_Y", trace_group_y as f64),
+                        (
+                            "PHOTON_METHODS",
+                            if entry == "photon_trace" {
+                                mode as f64
+                            } else {
+                                0.
+                            },
+                        ),
                         (
                             "ADAPTIVE_TRACE",
                             u32::from(entry == "accumulate_adaptive") as f64,
@@ -115,10 +140,19 @@ impl Caustics {
         };
         Self {
             group,
+            #[cfg(test)]
+            data,
+            #[cfg(test)]
+            diagnostic_offset: u64::from(weights - 8) * 4,
             offsets,
             uniform,
+            learning,
+            round: 0,
+            learn: pipeline("photon_learn", 0, false),
+            focus: pipeline("photon_focus", 0, false),
+            probabilities: pipeline("photon_probabilities", 0, false),
             clear: pipeline("photon_clear", 0, false),
-            emit: pipeline("photon_trace", 0, false),
+            emit: std::array::from_fn(|methods| pipeline("photon_trace", methods, false)),
             scan_buckets: pipeline("photon_scan_buckets", 0, false),
             scan_blocks: pipeline("photon_scan_blocks", 0, false),
             scatter: pipeline("photon_scatter", 0, false),
@@ -130,18 +164,29 @@ impl Caustics {
         }
     }
     pub fn prepare(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::BindGroup,
         worlds: &[GpuWorld; 2],
-        size: [u32; 2],
-        samples: u32,
+        frame: [u32; 3],
+        settings: &crate::settings::Settings,
     ) {
-        let [width, height] = size;
+        let [width, height, samples] = frame;
         let [photons, buckets, _, _] = self.offsets;
         // Accumulated photon count times r^2 grows while r tends to zero.
         let radius = 0.16 * (1.0 + samples as f32 / 64.0).powf(-1.0 / 6.0);
+        if samples == 0 {
+            self.round = 0;
+        }
+        let active = if settings.photon_budget == 0 {
+            (width * height / 4)
+                .max(1)
+                .next_power_of_two()
+                .clamp(4096, photons)
+        } else {
+            settings.photon_budget.clamp(256, photons)
+        };
         let parameters = Parameters {
             targets: std::array::from_fn(|i| {
                 worlds[i / 16]
@@ -151,6 +196,22 @@ impl Caustics {
                     .unwrap_or([0.; 4])
             }),
             layout: self.offsets,
+            spheres: std::array::from_fn(|i| {
+                worlds[i / 8]
+                    .glass_spheres
+                    .get((i % 8) / 2)
+                    .map_or([0.; 4], |s| s[i % 2])
+            }),
+            learning: self.learning,
+            features: [
+                u32::from(settings.photon_guiding)
+                    | (u32::from(settings.manifold_guiding) << 1)
+                    | (u32::from(settings.photon_reuse) << 2),
+                active,
+                self.round,
+                worlds[0].glass_spheres.len() as u32
+                    | ((worlds[1].glass_spheres.len() as u32) << 8),
+            ],
             shape: [
                 radius,
                 worlds[0].glass_targets.len() as f32,
@@ -162,12 +223,19 @@ impl Caustics {
         // Separate passes establish global storage visibility between clearing,
         // sorting and gathering photons. No per-bucket cap drops energy.
         for (pipeline, groups, rows) in [
+            (&self.focus, 2, 1),
+            (&self.learn, 16, 1),
+            (&self.probabilities, 1, 1),
             (
                 &self.clear,
                 1024,
-                (width * height * 6).max(buckets * 2).div_ceil(65536),
+                (width * height * 6).max(photons * 2).div_ceil(65536),
             ),
-            (&self.emit, photons.div_ceil(64), 2),
+            (
+                &self.emit[parameters.features[0] as usize],
+                active.div_ceil(64),
+                2,
+            ),
             (&self.scan_buckets, (buckets * 2) / 256, 1),
             (&self.scan_blocks, 1, 1),
             (&self.scatter, (photons * 2).div_ceil(64), 1),
@@ -178,6 +246,7 @@ impl Caustics {
             pass.set_bind_group(1, &self.group, &[]);
             pass.dispatch_workgroups(groups, rows, 1);
         }
+        self.round += 1;
     }
     pub fn adaptive_allocate(&self) -> &wgpu::ComputePipeline {
         &self.adaptive_allocate
@@ -255,6 +324,7 @@ mod tests {
             include_str!("../shaders/nrc.wgsl"),
             include_str!("../shaders/nrc_scalar.wgsl"),
             include_str!("../shaders/caustics.wgsl"),
+            include_str!("../shaders/caustics_sampling.wgsl"),
             include_str!("../shaders/denoise.wgsl"),
         ]
         .join("\n");
@@ -266,5 +336,18 @@ mod tests {
         )
         .validate(&module)
         .unwrap();
+        let span = module
+            .types
+            .iter()
+            .find_map(|(_, ty)| {
+                if ty.name.as_deref() == Some("CausticParams")
+                    && let naga::TypeInner::Struct { span, .. } = ty.inner
+                {
+                    return Some(span);
+                }
+                None
+            })
+            .unwrap();
+        assert_eq!(span as usize, std::mem::size_of::<super::Parameters>());
     }
 }

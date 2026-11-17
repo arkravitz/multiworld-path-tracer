@@ -1,13 +1,21 @@
 use crate::{
     gpu::{self, Renderer},
     scene::{GlassPreset, WorldPreset},
-    settings::{DenoiserKind, Mode, SamplingMode, Settings, View},
+    settings::{DenoiserKind, Mode, SamplingMode, Settings},
 };
 use anyhow::{Context, Result};
 use eframe::egui;
 use std::{path::PathBuf, time::Instant};
+mod labs;
+use labs::{Lab, Labs, glass_settings};
 
-pub fn run(settings: Settings, width: u32, height: u32, smoke_frames: Option<u32>) -> Result<()> {
+pub fn run(
+    mut settings: Settings,
+    width: u32,
+    height: u32,
+    smoke_frames: Option<u32>,
+) -> Result<()> {
+    let labs = Labs::new(&mut settings);
     let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     setup.instance_descriptor = gpu::instance_descriptor();
     setup.device_descriptor = std::sync::Arc::new(gpu::device_descriptor);
@@ -23,7 +31,7 @@ pub fn run(settings: Settings, width: u32, height: u32, smoke_frames: Option<u32
         ..Default::default()
     };
     eframe::run_native(
-        "Multiworld · stochastic transport lab",
+        "Multiworld · transport labs",
         options,
         Box::new(move |cc| {
             let state = cc
@@ -49,6 +57,7 @@ pub fn run(settings: Settings, width: u32, height: u32, smoke_frames: Option<u32
                 state,
                 texture,
                 settings,
+                labs,
                 paused: false,
                 status: String::new(),
                 resolution: [width, height],
@@ -57,6 +66,8 @@ pub fn run(settings: Settings, width: u32, height: u32, smoke_frames: Option<u32
                 frames: 0,
                 smoke_frames,
                 save_raw_requested: false,
+                pending_export: None,
+                writing_export: None,
                 capture_dir: default_capture_directory().to_string_lossy().into_owned(),
             }))
         }),
@@ -68,6 +79,7 @@ struct App {
     state: eframe::egui_wgpu::RenderState,
     texture: egui::TextureId,
     settings: Settings,
+    labs: Labs,
     paused: bool,
     status: String,
     resolution: [u32; 2],
@@ -76,18 +88,81 @@ struct App {
     frames: u32,
     smoke_frames: Option<u32>,
     save_raw_requested: bool,
+    pending_export: Option<PendingExport>,
+    writing_export: Option<(PathBuf, gpu::export::ImageExport)>,
     capture_dir: String,
+}
+struct PendingExport {
+    path: PathBuf,
+    raw: bool,
+    settings: Settings,
+    generation: Option<u64>,
+    started: Instant,
 }
 impl App {
     fn controls(&mut self, ui: &mut egui::Ui) -> bool {
         let mut save = false;
-        ui.heading("MULTIWORLD");
-        ui.label("Stochastic transport lab");
+        ui.heading("TRANSPORT LABS");
+        let mut selected = self.labs.active;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut selected, Lab::Multiworld, "Multiworld");
+            ui.selectable_value(&mut selected, Lab::Glass, "Glass & caustics");
+        });
+        if self.labs.switch(selected, &mut self.settings) {
+            self.renderer.reset();
+            self.status.clear();
+        }
+        let multiworld = self.labs.active == Lab::Multiworld;
+        ui.label(if multiworld {
+            "Multiworld lab · light across incompatible worlds"
+        } else {
+            "Glass & caustics lab · refraction and focused light"
+        });
+        if !multiworld {
+            egui::ComboBox::from_label("Composition")
+                .selected_text(match self.settings.mode {
+                    Mode::WorldB => "Scene B",
+                    Mode::Blend => "Blend two independent scenes",
+                    _ => "Scene A",
+                })
+                .show_ui(ui, |ui| {
+                    for (mode, label) in [
+                        (Mode::WorldA, "Scene A"),
+                        (Mode::WorldB, "Scene B"),
+                        (Mode::Blend, "Blend two independent scenes"),
+                    ] {
+                        ui.selectable_value(&mut self.settings.mode, mode, label);
+                    }
+                });
+            if self.settings.mode == Mode::Blend {
+                ui.add(egui::Slider::new(&mut self.settings.p, 0.0..=1.0).text("Scene A weight"));
+            }
+            if ui.button("Reset glass showcase").clicked() {
+                self.settings = glass_settings(self.settings.seed);
+                self.renderer.reset();
+            }
+        }
         ui.separator();
-        ui.label("Worlds");
+        ui.label(if multiworld {
+            "Worlds"
+        } else {
+            "Scenes & glass"
+        });
         for (slot, label) in [(0, "World A"), (1, "World B")] {
+            if !multiworld
+                && ((self.settings.mode == Mode::WorldA && slot == 1)
+                    || (self.settings.mode == Mode::WorldB && slot == 0))
+            {
+                continue;
+            }
             ui.horizontal(|ui| {
-                ui.label(label);
+                ui.label(if multiworld {
+                    label
+                } else if slot == 0 {
+                    "Scene A"
+                } else {
+                    "Scene B"
+                });
                 egui::ComboBox::from_id_salt(("world-preset", slot))
                     .selected_text(self.settings.worlds[slot].label())
                     .width(210.)
@@ -117,62 +192,52 @@ impl App {
                     });
             }
         }
-        if ui.button("Swap A ↔ B").clicked() {
+        if (multiworld || self.settings.mode == Mode::Blend) && ui.button("Swap A ↔ B").clicked()
+        {
             self.settings.worlds.swap(0, 1);
             self.settings.glass.swap(0, 1);
         }
-        if ui.button("Glass & caustics showcase").clicked() {
-            self.settings.worlds = [WorldPreset::GlassGallery, WorldPreset::CrystalGarden];
-            self.settings.glass = [GlassPreset::Assorted; 2];
-            self.settings.caustics = true;
-            self.settings.sampling = SamplingMode::Denoised;
-            self.settings.mode = Mode::WorldA;
-            self.settings.yaw = 0.6;
-            self.settings.pitch = 0.55;
-            self.settings.distance = 13.;
-            self.settings.depth = 20;
-            self.settings.exposure = 0.25;
-            self.settings.denoise = true;
-        }
-        ui.collapsing("Suggested pairings", |ui| {
-            for (label, pair) in [
-                (
-                    "Temple × grove",
-                    [WorldPreset::SunkenTemple, WorldPreset::BioluminescentGrove],
-                ),
-                (
-                    "Observatory × neon",
-                    [WorldPreset::LunarObservatory, WorldPreset::NeonDistrict],
-                ),
-                (
-                    "Temple × neon",
-                    [WorldPreset::SunkenTemple, WorldPreset::NeonDistrict],
-                ),
-                (
-                    "Original spheres × boxes",
-                    [WorldPreset::WarmSpheres, WorldPreset::CoolBoxes],
-                ),
-            ] {
-                if ui.button(label).clicked() {
-                    self.settings.worlds = pair;
-                }
-            }
-        });
-        ui.separator();
-        egui::ComboBox::from_label("Transport")
-            .selected_text(self.settings.mode.label())
-            .show_ui(ui, |ui| {
-                for mode in Mode::ALL {
-                    ui.selectable_value(&mut self.settings.mode, mode, mode.label());
+        if multiworld {
+            ui.collapsing("Suggested pairings", |ui| {
+                for (label, pair) in [
+                    (
+                        "Temple × grove",
+                        [WorldPreset::SunkenTemple, WorldPreset::BioluminescentGrove],
+                    ),
+                    (
+                        "Observatory × neon",
+                        [WorldPreset::LunarObservatory, WorldPreset::NeonDistrict],
+                    ),
+                    (
+                        "Temple × neon",
+                        [WorldPreset::SunkenTemple, WorldPreset::NeonDistrict],
+                    ),
+                    (
+                        "Original spheres × boxes",
+                        [WorldPreset::WarmSpheres, WorldPreset::CoolBoxes],
+                    ),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.settings.worlds = pair;
+                    }
                 }
             });
-        ui.add(egui::Slider::new(&mut self.settings.p, 0.0..=1.0).text("P(World A)"));
-        ui.add_enabled(
-            self.settings.mode == Mode::Persistent,
-            egui::Slider::new(&mut self.settings.persistence, 0.0..=1.0).text("Persistence s"),
-        );
-        if self.settings.mode == Mode::Blend {
-            ui.small("Blend weight updates without restarting A or B.");
+            ui.separator();
+            egui::ComboBox::from_label("Transport")
+                .selected_text(self.settings.mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in Mode::ALL {
+                        ui.selectable_value(&mut self.settings.mode, mode, mode.label());
+                    }
+                });
+            ui.add(egui::Slider::new(&mut self.settings.p, 0.0..=1.0).text("P(World A)"));
+            ui.add_enabled(
+                self.settings.mode == Mode::Persistent,
+                egui::Slider::new(&mut self.settings.persistence, 0.0..=1.0).text("Persistence s"),
+            );
+            if self.settings.mode == Mode::Blend {
+                ui.small("Blend weight updates without restarting A or B.");
+            }
         }
         ui.separator();
         ui.checkbox(
@@ -182,51 +247,132 @@ impl App {
         .on_hover_text(
             "Power-weighted lights, solid-angle sampling, and stratified world selection.",
         );
-        ui.checkbox(&mut self.settings.caustics, "Fast glass caustics (experimental)")
-            .on_hover_text("Aim light at glass. Sharp visible caustics; progressive photon gathering through glass.");
-        if self.settings.caustics {
-            if !self.settings.caustics_active() {
-                ui.small("Choose World A, World B or Image-space blend to use fast caustics.");
-            } else {
-                ui.small("Photon gathering improves over time. Neural caching is bypassed while this is active.");
+        if !multiworld {
+            if ui
+                .checkbox(
+                    &mut self.settings.photon_nrc,
+                    "Photon-driven neural cache (paper)",
+                )
+                .changed()
+            {
+                self.settings.sampling = SamplingMode::Uniform;
+                self.settings.neural_cache = false;
+                self.settings.caustics = !self.settings.photon_nrc;
             }
+            if self.settings.photon_nrc {
+                ui.small("SPPC photon teachers · hash-encoded cache · experimental");
+                ui.small(format!(
+                    "{} training rounds",
+                    self.renderer.photon_nrc_batches()
+                ));
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.photon_nrc_photons)
+                        .range(256..=524288)
+                        .speed(1024)
+                        .prefix("Photons "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.photon_nrc_queries)
+                        .range(1024..=32768)
+                        .speed(1024)
+                        .prefix("Queries "),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.settings.photon_nrc_global_radius, 0.01..=1.)
+                        .text("Global radius"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.settings.photon_nrc_caustic_radius, 0.005..=0.5)
+                        .text("Caustic radius"),
+                );
+                ui.small("Photon-trained lighting with path corrections to preserve shadows and fine caustics. Uncached preview after camera motion.");
+            }
+            ui.add_enabled_ui(!self.settings.photon_nrc, |ui| {
+                ui.checkbox(&mut self.settings.caustics, "Fast glass caustics (experimental)")
+                .on_hover_text("Aim light at glass. Sharp visible caustics; progressive photon gathering through glass.");
+                if self.settings.caustics {
+                    ui.small("Photon gathering improves over time. Compare raw export to check reconstruction.");
+                    ui.checkbox(
+                        &mut self.settings.photon_guiding,
+                        "Learn useful photon launches",
+                    );
+                    ui.checkbox(
+                        &mut self.settings.photon_reuse,
+                        "Reuse successful light paths",
+                    );
+                    ui.checkbox(
+                        &mut self.settings.manifold_guiding,
+                        "Manifold-guided spheres",
+                    );
+                    if self.settings.manifold_guiding {
+                        ui.small("Analytic sphere transmission solver; meshes keep ordinary photon proposals.");
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Photon budget");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.photon_budget)
+                                .range(0..=32768)
+                                .speed(256),
+                        );
+                    });
+                    ui.small("0 = automatic. Budget is per world and rendering dispatch.");
+                }
+            });
         }
-        ui.checkbox(
-            &mut self.settings.neural_cache,
-            "Neural radiance cache (experimental)",
-        )
-        .on_hover_text(
-            "Online GPU-trained MLP. Biased indirect lighting; compare with cache disabled.",
-        );
-        if self.settings.neural_cache {
+        if multiworld {
             ui.checkbox(
+                &mut self.settings.neural_cache,
+                "Neural radiance cache (experimental)",
+            )
+            .on_hover_text(
+                "Online GPU-trained MLP. Biased indirect lighting; compare with cache disabled.",
+            );
+            if self.settings.neural_cache {
+                ui.checkbox(
                 &mut self.settings.cache_self_training,
                 "Shorter training paths (experimental)",
             )
             .on_hover_text(
                 "Use learned lighting to shorten training rays. Keeps 1/16 fully traced; may trade accuracy for lower training cost.",
             );
-            let mut automatic = self.settings.cache_bounce == 0;
-            if ui
-                .checkbox(&mut automatic, "Automatic path-spread termination")
-                .changed()
-            {
-                self.settings.cache_bounce = if automatic { 0 } else { 2 };
+                let mut automatic = self.settings.cache_bounce == 0;
+                if ui
+                    .checkbox(&mut automatic, "Automatic path-spread termination")
+                    .changed()
+                {
+                    self.settings.cache_bounce = if automatic { 0 } else { 2 };
+                }
+                if !automatic {
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.cache_bounce, 1..=6)
+                            .text("First cache bounce"),
+                    );
+                }
+                ui.small(format!(
+                    "Fused GPU training · {} batches",
+                    self.renderer.neural_training_batches()
+                ));
+                ui.small("Approximate indirect light. Reset clears the learned cache.");
             }
-            if !automatic {
-                ui.add(
-                    egui::Slider::new(&mut self.settings.cache_bounce, 1..=6)
-                        .text("First cache bounce"),
+        }
+        if (self.settings.neural_cache || self.settings.photon_nrc)
+            && self.renderer.tensor_inference_available()
+        {
+            ui.checkbox(&mut self.settings.tensor_neural, "M5 tensor inference")
+                .on_hover_text(
+                    "Batched neural inference using Metal TensorOps and half-precision inputs.",
                 );
-            }
-            ui.small(format!(
-                "Fused GPU training · {} batches",
-                self.renderer.neural_training_batches()
-            ));
-            ui.small("Approximate indirect light. Reset clears the learned cache.");
+            ui.small(self.renderer.neural_inference_backend(&self.settings));
         }
         ui.checkbox(&mut self.settings.use_bvh, "BVH acceleration");
         if self.settings.use_bvh {
+            ui.add_enabled(
+                self.renderer.hardware_ray_tracing_available(),
+                egui::Checkbox::new(
+                    &mut self.settings.hardware_ray_tracing,
+                    "Hardware ray tracing",
+                ),
+            );
             ui.checkbox(
                 &mut self.settings.adaptive_bvh,
                 "Automatic small-scene fallback",
@@ -264,7 +410,12 @@ impl App {
             .selected_text(self.settings.sampling.label())
             .show_ui(ui, |ui| {
                 for mode in SamplingMode::ALL {
-                    ui.selectable_value(&mut self.settings.sampling, mode, mode.label());
+                    ui.add_enabled_ui(
+                        !self.settings.photon_nrc_active() || mode == SamplingMode::Uniform,
+                        |ui| {
+                            ui.selectable_value(&mut self.settings.sampling, mode, mode.label());
+                        },
+                    );
                 }
             });
         if self.settings.sampling != old_sampling
@@ -279,13 +430,23 @@ impl App {
                 ui.small("OIDN still guides adaptive sampling.");
             }
         }
-        ui.add(egui::Slider::new(&mut self.settings.spp, 1..=16).text(
-            if self.settings.sampling == SamplingMode::Uniform {
-                "Samples / frame"
-            } else {
-                "Average samples / frame"
-            },
-        ));
+        let single_job = self.settings.photon_nrc_active()
+            || self.settings.caustics_active()
+            || self.settings.neural_cache
+            || self.settings.sampling != SamplingMode::Uniform;
+        ui.add_enabled(
+            !single_job,
+            egui::Slider::new(&mut self.settings.spp, 1..=16).text(
+                if self.settings.sampling == SamplingMode::Uniform {
+                    "Samples / frame"
+                } else {
+                    "Average samples / frame"
+                },
+            ),
+        );
+        if single_job {
+            ui.small("One sample per interactive job keeps controls responsive.");
+        }
         ui.add(egui::Slider::new(&mut self.settings.depth, 1..=32).text("Max bounces"));
         ui.add(egui::Slider::new(&mut self.settings.exposure, -5.0..=5.0).text("Exposure (EV)"));
         ui.horizontal(|ui| {
@@ -306,20 +467,31 @@ impl App {
             if ui.button("Reset").clicked() {
                 self.renderer.reset();
             }
-            save = ui.button("Save PNG").clicked();
+            save = ui
+                .add_enabled(
+                    self.pending_export.is_none() && self.writing_export.is_none(),
+                    egui::Button::new("Save PNG"),
+                )
+                .clicked();
         });
-        self.save_raw_requested = ui.button("Save raw PNG").clicked();
+        self.save_raw_requested = ui
+            .add_enabled(
+                self.pending_export.is_none() && self.writing_export.is_none(),
+                egui::Button::new("Save raw PNG"),
+            )
+            .clicked();
         ui.collapsing("Export folder", |ui| {
             ui.text_edit_singleline(&mut self.capture_dir);
         });
         egui::ComboBox::from_label("View")
             .selected_text(self.settings.view.label())
             .show_ui(ui, |ui| {
-                for view in View::ALL {
+                for &view in self.labs.views() {
                     ui.selectable_value(&mut self.settings.view, view, view.label());
                 }
             });
-        ui.collapsing("World-space probability", |ui| {
+        if multiworld {
+            ui.collapsing("World-space probability", |ui| {
             ui.checkbox(&mut self.settings.spatial, "Use 3D value noise");
             ui.add(egui::Slider::new(&mut self.settings.threshold, 0.0..=1.0).text("Threshold"));
             ui.add(egui::Slider::new(&mut self.settings.frequency, 0.01..=2.0).text("Frequency"));
@@ -327,8 +499,9 @@ impl App {
             ui.add(egui::Slider::new(&mut self.settings.time, -10.0..=10.0).text("Time offset"));
             ui.small("Primary: first shared surface. Later: ray origin. Replaces constant p; no automatic animation.");
         });
-        ui.checkbox(&mut self.settings.primary_a, "Primary rays always in A");
-        ui.small("Applies to mixed path modes (4–6).");
+            ui.checkbox(&mut self.settings.primary_a, "Primary rays always in A");
+            ui.small("Applies to mixed path modes (4–6).");
+        }
         ui.collapsing("Camera & resolution", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Orbit");
@@ -368,7 +541,7 @@ impl App {
         });
         ui.separator();
         ui.monospace(format!(
-            "{:.1} FPS · {} {}\n{} × {}",
+            "UI {:.1} FPS · {} {}\n{} × {}",
             self.fps,
             self.renderer.samples,
             if self.settings.sampling == SamplingMode::Uniform {
@@ -382,7 +555,9 @@ impl App {
         let info = self.state.adapter.get_info();
         ui.small(format!("{} / {:?}", info.name, info.backend));
         ui.small("Drag image to orbit · scroll to zoom");
-        ui.small("Hybrid transport is an artificial process.");
+        if multiworld {
+            ui.small("Hybrid transport is an artificial process.");
+        }
         ui.small(concat!("Version ", env!("CARGO_PKG_VERSION")));
         if !self.status.is_empty() {
             ui.label(&self.status);
@@ -424,34 +599,72 @@ impl eframe::App for App {
                     (self.settings.distance * (-scroll * 0.002).exp()).clamp(5., 40.);
             }
         });
-        self.renderer.render(&self.settings, !self.paused);
-        if self.save_raw_requested {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let path = PathBuf::from(&self.capture_dir)
-                .join(format!("{}-raw-{stamp}.png", self.settings.mode.slug()));
-            self.status = match self.renderer.save_raw_png(&path) {
-                Ok(()) => format!("Saved {}", path.display()),
-                Err(e) => format!("Raw export failed: {e:#}"),
-            };
+        if save || self.save_raw_requested {
+            let raw = self.save_raw_requested;
             self.save_raw_requested = false;
-        }
-        if save {
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
+            let suffix = if raw { "raw" } else { "display" };
             let path = PathBuf::from(&self.capture_dir).join(format!(
-                "{}-{}spp-{stamp}.png",
-                self.settings.mode.slug(),
-                self.renderer.samples
+                "{}-{suffix}-{stamp}.png",
+                self.settings.mode.slug()
             ));
-            self.status = match self.renderer.save_png(&path) {
+            self.pending_export = Some(PendingExport {
+                path,
+                raw,
+                settings: self.settings.clone(),
+                generation: None,
+                started: Instant::now(),
+            });
+            self.status = "Preparing image export…".into();
+        }
+        if self.pending_export.as_ref().is_some_and(|p| {
+            p.settings != self.settings
+                || p.generation
+                    .is_some_and(|g| g != self.renderer.image_generation())
+        }) {
+            self.pending_export = None;
+            self.status = "Export canceled because render settings changed.".into();
+        }
+        let export_needs_sample = self.pending_export.as_ref().is_some_and(|p| {
+            p.generation.is_none() && !self.renderer.has_accumulation_for(&p.settings)
+        });
+        let applied = self.renderer.render_live(
+            &self.settings,
+            export_needs_sample || (!self.paused && self.pending_export.is_none()),
+        );
+        if let Some(pending) = &mut self.pending_export {
+            if applied && pending.generation.is_none() {
+                pending.generation = Some(self.renderer.image_generation());
+            }
+            if pending.started.elapsed() > std::time::Duration::from_secs(120) {
+                self.pending_export = None;
+                self.status = "Image export timed out.".into();
+            } else if pending.generation.is_some()
+                && self
+                    .renderer
+                    .image_export_ready(&self.settings, pending.raw)
+            {
+                let pending = self.pending_export.take().unwrap();
+                match self.renderer.start_image_export(&pending.path, pending.raw) {
+                    Ok(job) => {
+                        self.writing_export = Some((pending.path, job));
+                        self.status = "Writing PNG…".into();
+                    }
+                    Err(error) => self.status = format!("Export failed: {error:#}"),
+                }
+            }
+        }
+        if let Some((path, job)) = &self.writing_export
+            && let Some(result) = job.poll()
+        {
+            self.status = match result {
                 Ok(()) => format!("Saved {}", path.display()),
-                Err(e) => format!("Export failed: {e:#}"),
+                Err(error) => format!("Export failed: {error:#}"),
             };
+            self.writing_export = None;
         }
         self.frames += 1;
         if self.smoke_frames.is_some_and(|n| self.frames >= n) {
@@ -463,8 +676,13 @@ impl eframe::App for App {
             }
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if !self.paused {
-            ui.ctx().request_repaint();
+        if !self.paused
+            || self.renderer.has_live_work()
+            || self.pending_export.is_some()
+            || self.writing_export.is_some()
+        {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(8));
         }
     }
 }

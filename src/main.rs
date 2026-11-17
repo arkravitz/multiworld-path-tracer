@@ -18,6 +18,9 @@ struct Args {
     /// Use the linear intersection reference instead of the per-world BVHs.
     #[arg(long)]
     brute_force: bool,
+    /// Use software traversal for comparison even when hardware ray queries are available.
+    #[arg(long)]
+    software_tracing: bool,
     /// Force BVH traversal even for small sphere-only worlds.
     #[arg(long, conflicts_with = "brute_force")]
     force_bvh: bool,
@@ -31,9 +34,40 @@ struct Args {
     /// Experimental biased online neural radiance cache; fused GPU kernels.
     #[arg(long)]
     neural_cache: bool,
+    /// Compare neural caches using the previous SIMD/scalar inference path.
+    #[arg(long)]
+    simd_neural: bool,
     /// Targeted light tracing and progressive photon gathering (fixed worlds/blend).
     #[arg(long)]
     caustics: bool,
+    /// Photon-driven neural radiance caching (SPPC), fixed worlds/blend only.
+    #[arg(long)]
+    photon_nrc: bool,
+    #[arg(long,default_value_t=32768,value_parser=clap::value_parser!(u32).range(256..=524288))]
+    photon_nrc_photons: u32,
+    #[arg(long,default_value_t=2048,value_parser=clap::value_parser!(u32).range(1024..=32768))]
+    photon_nrc_queries: u32,
+    #[arg(long,default_value_t=14,value_parser=clap::value_parser!(u32).range(10..=19))]
+    photon_nrc_hash_log2: u32,
+    #[arg(long, default_value_t = 0.25)]
+    photon_nrc_global_radius: f32,
+    #[arg(long, default_value_t = 0.08)]
+    photon_nrc_caustic_radius: f32,
+    /// Learn light/caster selection from earlier photon contributions.
+    #[arg(long, requires = "caustics", conflicts_with = "no_photon_guiding")]
+    photon_guiding: bool,
+    /// Restore uniform caster selection instead of the default learned guide.
+    #[arg(long, requires = "caustics")]
+    no_photon_guiding: bool,
+    /// Weighted temporal and neighboring-reservoir reuse of light-path seeds.
+    #[arg(long, requires = "caustics")]
+    photon_reuse: bool,
+    /// Newton-solved sphere transmission paths guide normalized emission cones.
+    #[arg(long, requires = "caustics")]
+    manifold_guiding: bool,
+    /// Light paths per active world and dispatch; zero selects automatic sizing.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=32768))]
+    photon_budget: u32,
     #[arg(long, default_value_t = 0)]
     cache_bounce: u32,
     /// Shorten training paths using learned lighting; retain 1/16 uncached anchors.
@@ -110,12 +144,24 @@ fn main() -> Result<()> {
         glass: [args.glass_a, args.glass_b],
         light_sampling: !args.no_light_sampling,
         use_bvh: !args.brute_force,
+        hardware_ray_tracing: !args.software_tracing && !args.force_bvh,
         adaptive_bvh: !args.force_bvh,
         denoise: args.denoise || args.sampling == SamplingMode::Denoised,
         denoiser: args.denoiser,
         sampling: args.sampling,
         neural_cache: args.neural_cache,
+        tensor_neural: !args.simd_neural,
         caustics: args.caustics,
+        photon_nrc: args.photon_nrc,
+        photon_nrc_photons: args.photon_nrc_photons,
+        photon_nrc_queries: args.photon_nrc_queries,
+        photon_nrc_hash_log2: args.photon_nrc_hash_log2,
+        photon_nrc_global_radius: args.photon_nrc_global_radius,
+        photon_nrc_caustic_radius: args.photon_nrc_caustic_radius,
+        photon_guiding: args.photon_guiding || (args.caustics && !args.no_photon_guiding),
+        photon_reuse: args.photon_reuse,
+        manifold_guiding: args.manifold_guiding,
+        photon_budget: args.photon_budget,
         cache_bounce: args.cache_bounce,
         cache_self_training: args.cache_self_training,
         p: args.probability,
@@ -128,6 +174,22 @@ fn main() -> Result<()> {
         primary_a: args.primary_a,
         ..Default::default()
     };
+    ensure!(
+        !args.photon_nrc
+            || (matches!(args.mode, Mode::WorldA | Mode::WorldB | Mode::Blend)
+                && args.sampling == SamplingMode::Uniform
+                && !args.all_modes),
+        "Photon NRC supports fixed worlds/blend and uniform sampling"
+    );
+    ensure!(
+        args.photon_nrc_global_radius.is_finite()
+            && args.photon_nrc_global_radius >= 0.01
+            && args.photon_nrc_global_radius <= 2.
+            && args.photon_nrc_caustic_radius.is_finite()
+            && args.photon_nrc_caustic_radius >= 0.005
+            && args.photon_nrc_caustic_radius <= 2.,
+        "Invalid photon NRC radii"
+    );
     if !args.headless {
         return app::run(settings, args.width, args.height, args.smoke_frames);
     }
@@ -175,8 +237,21 @@ fn main() -> Result<()> {
         settings.sampling, settings.denoiser
     ));
     report.push_str(&format!(
+        "Photon guiding: {}; reservoir reuse: {}; manifold-guided spheres: {}; photon budget: {} (0=auto)\n",
+        settings.photon_guiding, settings.photon_reuse, settings.manifold_guiding, settings.photon_budget
+    ));
+    report.push_str(&format!(
         "Neural cache: {}, cache bounce: {}, self-training: {}\n",
         settings.neural_cache, settings.cache_bounce, settings.cache_self_training
+    ));
+    report.push_str(&format!(
+        "Photon NRC: {}; photons {}; queries {}; hash log2 {}; radii {}/{}\n",
+        settings.photon_nrc,
+        settings.photon_nrc_photons,
+        settings.photon_nrc_queries,
+        settings.photon_nrc_hash_log2,
+        settings.photon_nrc_global_radius,
+        settings.photon_nrc_caustic_radius
     ));
     for mode in modes {
         settings.mode = mode;

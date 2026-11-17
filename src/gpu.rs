@@ -1,12 +1,27 @@
 mod adaptive;
 mod caustics;
 mod denoise;
+pub mod export;
+mod metal;
 mod nrc;
 mod oidn;
+mod photon_nrc;
+mod ray_query;
+mod tensor;
 use crate::{bvh::Bvh, scene, settings::Settings};
 use anyhow::{Context, Result, ensure};
 use bytemuck::{Pod, Zeroable};
-use std::{fs::File, io::BufWriter, path::Path, sync::mpsc, time::Duration};
+use std::{
+    fs::File,
+    io::BufWriter,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
 use wgpu::util::DeviceExt;
 
 pub fn instance_descriptor() -> wgpu::InstanceDescriptor {
@@ -24,17 +39,44 @@ pub fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'sta
     } else {
         wgpu::Features::empty()
     };
+    let native = if adapter.get_info().backend == wgpu::Backend::Metal {
+        adapter.features() & wgpu::Features::PASSTHROUGH_SHADERS
+    } else {
+        wgpu::Features::empty()
+    };
+    let queries = if metal::ray_query_hardware(adapter)
+        && adapter
+            .limits()
+            .max_acceleration_structures_per_shader_stage
+            >= 2
+        && adapter.limits().max_tlas_instance_count >= 2
+    {
+        adapter.features() & wgpu::Features::EXPERIMENTAL_RAY_QUERY
+    } else {
+        wgpu::Features::empty()
+    };
+    let features = matrices | native | queries;
     wgpu::DeviceDescriptor {
         label: Some("Multiworld compute device"),
-        required_features: matrices,
+        required_features: features,
         // The optional hardware matrix path is explicitly feature-gated. The
         // fallback never parses experimental WGSL on unsupported adapters.
-        experimental_features: if matrices.is_empty() {
+        experimental_features: if features.is_empty() {
             wgpu::ExperimentalFeatures::disabled()
         } else {
             unsafe { wgpu::ExperimentalFeatures::enabled() }
         },
         required_limits: wgpu::Limits {
+            max_storage_buffers_per_shader_stage: adapter
+                .limits()
+                .max_storage_buffers_per_shader_stage
+                .min(12),
+            max_blas_primitive_count: adapter.limits().max_blas_primitive_count,
+            max_blas_geometry_count: adapter.limits().max_blas_geometry_count,
+            max_tlas_instance_count: adapter.limits().max_tlas_instance_count,
+            max_acceleration_structures_per_shader_stage: adapter
+                .limits()
+                .max_acceleration_structures_per_shader_stage,
             max_storage_buffer_binding_size: adapter
                 .limits()
                 .max_storage_buffer_binding_size
@@ -56,7 +98,13 @@ pub async fn headless_device() -> Result<(wgpu::Device, wgpu::Queue)> {
         .context("No compute-capable GPU adapter (Metal/Vulkan/DX12) found")?;
     let info = adapter.get_info();
     eprintln!("GPU: {} / {:?}", info.name, info.backend);
-    Ok(adapter.request_device(&device_descriptor(&adapter)).await?)
+    let (device, queue) = adapter.request_device(&device_descriptor(&adapter)).await?;
+    eprintln!(
+        "Acceleration available: ray queries {}, M5 TensorOps {}",
+        ray_query::supported(&device),
+        metal::tensor_accelerators(&device)
+    );
+    Ok((device, queue))
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -115,6 +163,7 @@ pub struct Renderer {
     generation: u64,
     neural: Option<nrc::Neural>,
     caustics: Option<caustics::Caustics>,
+    photon_nrc: Option<photon_nrc::PhotonNrc>,
     adaptive: Option<adaptive::Adaptive>,
     shader: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
@@ -123,11 +172,15 @@ pub struct Renderer {
     bind_group: wgpu::BindGroup,
     layout: wgpu::BindGroupLayout,
     trace: [wgpu::ComputePipeline; 6],
+    trace_group_y: u32,
+    trace_hardware: Option<[wgpu::ComputePipeline; 6]>,
     present: wgpu::ComputePipeline,
     scene_seed: u32,
     scene_presets: [scene::WorldPreset; 2],
     scene_glass: [scene::GlassPreset; 2],
     previous: Option<Settings>,
+    live_in_flight: Arc<AtomicBool>,
+    render_submissions: u64,
     needs_clear: bool,
     display_dirty: bool,
 }
@@ -139,6 +192,21 @@ impl Renderer {
         height: u32,
         seed: u32,
     ) -> Result<Self> {
+        Self::new_with_workgroup(device, queue, width, height, seed, 8)
+    }
+    /// Benchmark alternate trace workgroups without changing sampling streams.
+    pub fn new_with_workgroup(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        width: u32,
+        height: u32,
+        seed: u32,
+        trace_group_y: u32,
+    ) -> Result<Self> {
+        ensure!(
+            [4, 8, 16, 32].contains(&trace_group_y),
+            "Trace workgroup height must be 4, 8, 16 or 32"
+        );
         Self::validate_size(&device, width, height)?;
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Transport parameters"),
@@ -148,30 +216,43 @@ impl Renderer {
         });
         let scenes = scene::worlds(seed);
         let worlds = [
-            GpuWorld::new(&device, &scenes[0])?,
-            GpuWorld::new(&device, &scenes[1])?,
+            GpuWorld::new(&device, &queue, &scenes[0])?,
+            GpuWorld::new(&device, &queue, &scenes[1])?,
         ];
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Scene query and persistent accumulation"),
-            entries: &[
-                buffer_entry(0, wgpu::BufferBindingType::Uniform),
-                buffer_entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer_entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer_entry(3, wgpu::BufferBindingType::Storage { read_only: false }),
-                buffer_entry(5, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer_entry(6, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer_entry(7, wgpu::BufferBindingType::Storage { read_only: false }),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
+        let mut entries = vec![
+            buffer_entry(0, wgpu::BufferBindingType::Uniform),
+            buffer_entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
+            buffer_entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
+            buffer_entry(3, wgpu::BufferBindingType::Storage { read_only: false }),
+            buffer_entry(5, wgpu::BufferBindingType::Storage { read_only: true }),
+            buffer_entry(6, wgpu::BufferBindingType::Storage { read_only: true }),
+            buffer_entry(7, wgpu::BufferBindingType::Storage { read_only: false }),
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ];
+        if ray_query::supported(&device) {
+            for binding in [8, 9] {
+                entries.push(wgpu::BindGroupLayoutEntry {
+                    binding,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                    ty: wgpu::BindingType::AccelerationStructure {
+                        vertex_return: false,
                     },
                     count: None,
-                },
-            ],
+                });
+            }
+        }
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Scene query and persistent accumulation"),
+            entries: &entries,
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Multiworld integrator"),
@@ -181,24 +262,27 @@ impl Renderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Stochastic multiworld transport"),
             source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "{}\n{}\n{}\n{}",
-                    concat!(
+                ray_query::shader(
+                    &device,
+                    format!(
+                        "{}\n{}\n{}\n{}",
                         concat!(
-                            include_str!("shaders/trace.wgsl"),
+                            concat!(
+                                include_str!("shaders/trace.wgsl"),
+                                "\n",
+                                include_str!("shaders/adaptive.wgsl")
+                            ),
                             "\n",
-                            include_str!("shaders/adaptive.wgsl")
+                            include_str!("shaders/caustics_stub.wgsl")
                         ),
-                        "\n",
-                        include_str!("shaders/caustics_stub.wgsl")
+                        include_str!("shaders/nrc.wgsl"),
+                        include_str!("shaders/nrc_scalar.wgsl"),
+                        concat!(
+                            include_str!("shaders/denoise.wgsl"),
+                            "\n",
+                            include_str!("shaders/oidn.wgsl")
+                        )
                     ),
-                    include_str!("shaders/nrc.wgsl"),
-                    include_str!("shaders/nrc_scalar.wgsl"),
-                    concat!(
-                        include_str!("shaders/denoise.wgsl"),
-                        "\n",
-                        include_str!("shaders/oidn.wgsl")
-                    )
                 )
                 .into(),
             ),
@@ -213,19 +297,27 @@ impl Renderer {
                 cache: None,
             })
         };
-        let trace = std::array::from_fn(|mode| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Transport-specialized accumulation"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("accumulate"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &[("ACTIVE_MODE", mode as f64)],
-                    ..Default::default()
-                },
-                cache: None,
+        let traces = |hardware: bool| {
+            std::array::from_fn(|mode| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("Transport-specialized accumulation"),
+                    layout: Some(&pipeline_layout),
+                    module: &shader,
+                    entry_point: Some("accumulate"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[
+                            ("ACTIVE_MODE", mode as f64),
+                            ("TRACE_GROUP_Y", trace_group_y as f64),
+                            ("HARDWARE_QUERIES", f64::from(hardware)),
+                        ],
+                        ..Default::default()
+                    },
+                    cache: None,
+                })
             })
-        });
+        };
+        let trace = traces(false);
+        let trace_hardware = ray_query::supported(&device).then(|| traces(true));
         let present = pipeline("present");
         let (pixels, texture, view) = targets(&device, width, height);
         let frames = device.create_buffer(&wgpu::BufferDescriptor {
@@ -252,6 +344,7 @@ impl Renderer {
             generation: 0,
             neural: None,
             caustics: None,
+            photon_nrc: None,
             adaptive: None,
             shader,
             pipeline_layout,
@@ -260,6 +353,8 @@ impl Renderer {
             bind_group,
             layout,
             trace,
+            trace_group_y,
+            trace_hardware,
             present,
             scene_seed: seed,
             scene_presets: [
@@ -268,6 +363,8 @@ impl Renderer {
             ],
             scene_glass: [scene::GlassPreset::Assorted; 2],
             previous: None,
+            live_in_flight: Arc::new(AtomicBool::new(false)),
+            render_submissions: 0,
             needs_clear: true,
             display_dirty: true,
         })
@@ -313,6 +410,7 @@ impl Renderer {
         self.oidn = None;
         self.neural = None;
         self.caustics = None;
+        self.photon_nrc = None;
         self.reset();
         Ok(())
     }
@@ -321,8 +419,8 @@ impl Renderer {
     /// Changing the seed later restores the generated worlds and both BVHs.
     pub fn set_worlds(&mut self, scenes: &[Vec<scene::Object>; 2]) -> Result<()> {
         let worlds = [
-            GpuWorld::new(&self.device, &scenes[0])?,
-            GpuWorld::new(&self.device, &scenes[1])?,
+            GpuWorld::new(&self.device, &self.queue, &scenes[0])?,
+            GpuWorld::new(&self.device, &self.queue, &scenes[1])?,
         ];
         self.worlds = worlds;
         self.bind_group = bindings(
@@ -337,10 +435,34 @@ impl Renderer {
         self.reset();
         Ok(())
     }
+    pub fn hardware_ray_tracing_available(&self) -> bool {
+        ray_query::supported(&self.device)
+    }
+    pub fn tensor_inference_available(&self) -> bool {
+        metal::tensor_accelerators(&self.device)
+    }
+    pub fn neural_inference_backend(&self, settings: &Settings) -> &'static str {
+        let tensor = if settings.photon_nrc {
+            self.photon_nrc.as_ref().is_some_and(|n| n.tensor.is_some())
+        } else {
+            self.neural.as_ref().is_some_and(|n| n.tensor.is_some())
+        };
+        if settings.tensor_neural && tensor {
+            "Metal TensorOps"
+        } else {
+            "GPU SIMD / scalar"
+        }
+    }
+    pub fn photon_nrc_batches(&self) -> u32 {
+        self.photon_nrc.as_ref().map_or(0, |m| m.batches)
+    }
     pub fn neural_training_batches(&self) -> u32 {
         self.neural.as_ref().map_or(0, |n| n.batches)
     }
     pub fn reset(&mut self) {
+        if let Some(cache) = &mut self.photon_nrc {
+            cache.reset();
+        }
         if let Some(neural) = &mut self.neural {
             neural.reset();
         }
@@ -363,6 +485,44 @@ impl Renderer {
     pub fn render(&mut self, settings: &Settings, advance: bool) {
         self.dispatch(settings, advance, true);
     }
+    /// Interactive entry point; headless render/accumulate retain exact budgets.
+    pub fn render_live(&mut self, settings: &Settings, advance: bool) -> bool {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        if self.live_in_flight.load(Ordering::Acquire) {
+            return false;
+        }
+        let before = self.render_submissions;
+        // Heavy paths expand spp into separate full-frame submissions. Keep
+        // one such sample per interactive job so controls never trail a batch.
+        if advance
+            && settings.spp > 1
+            && (settings.caustics_active()
+                || settings.photon_nrc_active()
+                || settings.neural_cache
+                || settings.sampling != crate::settings::SamplingMode::Uniform)
+        {
+            self.render(
+                &Settings {
+                    spp: 1,
+                    ..settings.clone()
+                },
+                true,
+            );
+        } else {
+            self.render(settings, advance);
+        }
+        if self.render_submissions != before {
+            self.live_in_flight.store(true, Ordering::Release);
+            let pending = self.live_in_flight.clone();
+            self.queue
+                .on_submitted_work_done(move || pending.store(false, Ordering::Release));
+        }
+        true
+    }
+    pub fn has_live_work(&self) -> bool {
+        self.live_in_flight.load(Ordering::Acquire)
+            || self.oidn.as_ref().is_some_and(|o| o.has_pending_work())
+    }
     /// Headless batches defer tone mapping until render(settings, false). No
     /// readback, intermediate display pass, or extra RNG work is needed per batch.
     pub fn accumulate(&mut self, settings: &Settings) {
@@ -371,7 +531,9 @@ impl Renderer {
     fn dispatch(&mut self, settings: &Settings, advance: bool, display: bool) {
         // Queued inference owns one query per world/pixel. Preserve the public
         // sample budget by ordering one-sample trace/resolve/training steps.
-        let adaptive_sampling = settings.sampling != crate::settings::SamplingMode::Uniform;
+        let photon_cache = settings.photon_nrc_active();
+        let adaptive_sampling =
+            settings.sampling != crate::settings::SamplingMode::Uniform && !photon_cache;
         let temporal =
             settings.denoise && settings.denoiser == crate::settings::DenoiserKind::Temporal;
         let oidn_display =
@@ -382,9 +544,12 @@ impl Renderer {
             oidn.collect(&self.device, &self.queue, self.generation);
             self.display_dirty |= ready != oidn.completed_samples();
         }
-        let fast_caustics = settings.caustics_active();
-        let neural_cache = settings.neural_cache && !fast_caustics;
-        if (neural_cache || fast_caustics || adaptive_sampling) && advance && settings.spp > 1 {
+        let fast_caustics = settings.caustics_active() && !photon_cache;
+        let neural_cache = settings.neural_cache && !fast_caustics && !photon_cache;
+        if (neural_cache || fast_caustics || adaptive_sampling || photon_cache)
+            && advance
+            && settings.spp > 1
+        {
             let single = Settings {
                 spp: 1,
                 ..settings.clone()
@@ -443,12 +608,30 @@ impl Renderer {
                 [self.width, self.height],
             ));
         }
+        if photon_cache
+            && self
+                .photon_nrc
+                .as_ref()
+                .is_none_or(|m| !m.matches(settings))
+        {
+            self.photon_nrc = Some(
+                photon_nrc::PhotonNrc::new(
+                    &self.device,
+                    &self.layout,
+                    [self.width, self.height],
+                    settings,
+                    self.trace_group_y,
+                )
+                .expect("validated photon NRC allocation"),
+            );
+        }
         if fast_caustics && self.caustics.is_none() {
             self.caustics = Some(caustics::Caustics::new(
                 &self.device,
                 &self.layout,
                 self.width,
                 self.height,
+                self.trace_group_y,
             ));
         }
         if neural_cache && self.neural.is_none() {
@@ -458,6 +641,7 @@ impl Renderer {
                 &self.layout,
                 self.width,
                 self.height,
+                self.trace_group_y,
             ));
         }
         if temporal && self.denoiser.is_none() {
@@ -493,6 +677,7 @@ impl Renderer {
                 &self.shader,
                 &self.layout,
                 &self.pipeline_layout,
+                self.trace_group_y,
             ));
         }
         if !temporal && let Some(denoiser) = &mut self.denoiser {
@@ -547,7 +732,29 @@ impl Renderer {
                         | (u32::from(enabled(&self.worlds[1])) << 1)) as f32
                 } else {
                     0.0
-                }) + if trace && present && !temporal && !neural_cache && !adaptive_sampling {
+                }) + if settings.use_bvh
+                    && settings.hardware_ray_tracing
+                    && self.hardware_ray_tracing_available()
+                {
+                    let adaptive = settings.adaptive_bvh
+                        && matches!(
+                            settings.mode,
+                            crate::settings::Mode::WorldA
+                                | crate::settings::Mode::WorldB
+                                | crate::settings::Mode::Blend
+                        );
+                    let enabled = |world: &GpuWorld| !adaptive || !world.prefer_linear;
+                    (16 * (u32::from(enabled(&self.worlds[0]))
+                        | (u32::from(enabled(&self.worlds[1])) << 1))) as f32
+                } else {
+                    0.0
+                } + if trace
+                    && present
+                    && !temporal
+                    && !neural_cache
+                    && !adaptive_sampling
+                    && !photon_cache
+                {
                     8.0
                 } else {
                     0.0
@@ -579,7 +786,11 @@ impl Renderer {
             ],
             reconstruction: [
                 settings.denoise_strength,
-                settings.sampling as u32 as f32,
+                if photon_cache {
+                    0.
+                } else {
+                    settings.sampling as u32 as f32
+                },
                 16.,
                 0.,
             ],
@@ -594,6 +805,14 @@ impl Renderer {
             right: camera[2],
             up: camera[3],
         };
+        let hardware_mask = (params.controls[3] as u32 >> 4) & 3;
+        let hardware_trace = hardware_mask
+            & match settings.mode {
+                crate::settings::Mode::WorldA => 1,
+                crate::settings::Mode::WorldB => 2,
+                _ => 3,
+            }
+            != 0;
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
         let mut encoder = self
@@ -607,14 +826,23 @@ impl Renderer {
                 .unwrap()
                 .initialize(&mut encoder, &self.bind_group);
         }
-        if trace && fast_caustics {
-            self.caustics.as_ref().unwrap().prepare(
+        if trace && photon_cache {
+            self.photon_nrc.as_mut().unwrap().prepare(
                 &self.queue,
                 &mut encoder,
                 &self.bind_group,
                 &self.worlds,
-                [self.width, self.height],
-                self.samples,
+                settings,
+            );
+        }
+        if trace && fast_caustics {
+            self.caustics.as_mut().unwrap().prepare(
+                &self.queue,
+                &mut encoder,
+                &self.bind_group,
+                &self.worlds,
+                [self.width, self.height, self.samples],
+                settings,
             );
         }
         if let Some(oidn) = &mut self.oidn {
@@ -657,6 +885,13 @@ impl Renderer {
                         neural_cache,
                     ));
                 }
+            } else if photon_cache {
+                pass.set_pipeline(
+                    self.photon_nrc
+                        .as_ref()
+                        .unwrap()
+                        .trace(settings.mode as usize, temporal),
+                );
             } else if fast_caustics {
                 pass.set_pipeline(
                     self.caustics
@@ -672,12 +907,25 @@ impl Renderer {
                         .trace_pipeline(settings.mode as usize, temporal),
                 );
             } else if temporal {
-                pass.set_pipeline(&self.denoiser.as_ref().unwrap().trace[settings.mode as usize]);
+                pass.set_pipeline(
+                    self.denoiser
+                        .as_ref()
+                        .unwrap()
+                        .trace_pipeline(settings.mode as usize, hardware_trace),
+                );
             } else {
-                pass.set_pipeline(&self.trace[settings.mode as usize]);
+                pass.set_pipeline(
+                    &(if hardware_trace {
+                        self.trace_hardware.as_ref().unwrap()
+                    } else {
+                        &self.trace
+                    })[settings.mode as usize],
+                );
             }
             pass.set_bind_group(0, &self.bind_group, &[]);
-            if fast_caustics {
+            if photon_cache {
+                pass.set_bind_group(1, &self.photon_nrc.as_ref().unwrap().group, &[]);
+            } else if fast_caustics {
                 pass.set_bind_group(1, &self.caustics.as_ref().unwrap().group, &[]);
             } else if neural_cache && !adaptive_sampling {
                 pass.set_bind_group(1, &self.neural.as_ref().unwrap().queries, &[]);
@@ -685,7 +933,11 @@ impl Renderer {
             if adaptive_sampling {
                 pass.dispatch_workgroups_indirect(&self.adaptive.as_ref().unwrap().indirect, 0);
             } else {
-                pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+                pass.dispatch_workgroups(
+                    self.width.div_ceil(8),
+                    self.height.div_ceil(self.trace_group_y),
+                    1,
+                );
             }
         }
         if trace && adaptive_sampling && temporal {
@@ -700,9 +952,19 @@ impl Renderer {
                 &mut encoder,
                 &self.bind_group,
                 settings.mode as usize,
-                self.width,
-                self.height,
+                [self.width, self.height],
                 temporal,
+                settings.tensor_neural,
+            );
+        }
+        if trace && photon_cache {
+            self.photon_nrc.as_ref().unwrap().resolve(
+                &mut encoder,
+                &self.bind_group,
+                [self.width, self.height],
+                settings.mode as usize,
+                temporal,
+                settings.tensor_neural,
             );
         }
         if use_oidn
@@ -740,7 +1002,7 @@ impl Renderer {
             );
         }
         if present
-            && (!trace || neural_cache || adaptive_sampling)
+            && (!trace || neural_cache || adaptive_sampling || photon_cache)
             && !temporal
             && !(oidn_display && self.oidn.as_ref().is_some_and(|o| o.has_image()))
         {
@@ -751,6 +1013,13 @@ impl Renderer {
             pass.set_pipeline(&self.present);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+        }
+        if trace && photon_cache && batch > 0 {
+            self.photon_nrc.as_mut().unwrap().learn(
+                &mut encoder,
+                &self.bind_group,
+                settings.photon_nrc_photons,
+            );
         }
         // Tracing sees a frozen model; teachers and training run AFTER it, and
         // publish the next model only for the following dispatch.
@@ -763,8 +1032,9 @@ impl Renderer {
             );
         }
         self.queue.submit([encoder.finish()]);
+        self.render_submissions = self.render_submissions.wrapping_add(1);
         if let Some(oidn) = &mut self.oidn {
-            oidn.after_submit();
+            oidn.after_submit(&self.queue);
         }
         self.samples += batch;
         self.needs_clear = false;
@@ -936,6 +1206,11 @@ impl Renderer {
     /// Export the unfiltered tone-mapped radiance without changing the live image
     /// or consuming/resetting any temporal history.
     pub fn save_raw_png(&self, path: &Path) -> Result<()> {
+        let (texture, encoder) = self.raw_export_target();
+        self.queue.submit([encoder.finish()]);
+        self.save_texture_png(&texture, path)
+    }
+    fn raw_export_target(&self) -> (wgpu::Texture, wgpu::CommandEncoder) {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Raw PNG export"),
             size: self.texture.size(),
@@ -963,8 +1238,46 @@ impl Renderer {
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
         }
-        self.queue.submit([encoder.finish()]);
-        self.save_texture_png(&texture, path)
+        (texture, encoder)
+    }
+    pub fn image_generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn has_accumulation_for(&self, settings: &Settings) -> bool {
+        self.samples > 0
+            && self
+                .previous
+                .as_ref()
+                .is_some_and(|old| !settings.invalidates(old))
+    }
+    /// The UI holds accumulation while an export snapshot is being finished.
+    pub fn image_export_ready(&self, settings: &Settings, raw: bool) -> bool {
+        !self.live_in_flight.load(Ordering::Acquire)
+            && (raw
+                || !settings.denoise
+                || settings.denoiser != crate::settings::DenoiserKind::Oidn
+                || self.samples == 0
+                || self
+                    .oidn
+                    .as_ref()
+                    .is_some_and(|o| o.ready(self.samples) || o.failed))
+    }
+    pub fn start_image_export(&self, path: &Path, raw: bool) -> Result<export::ImageExport> {
+        if raw {
+            let (texture, encoder) = self.raw_export_target();
+            export::start(&self.device, &self.queue, encoder, &texture, path)
+        } else {
+            if self
+                .previous
+                .as_ref()
+                .is_some_and(|s| s.denoise && s.denoiser == crate::settings::DenoiserKind::Oidn)
+                && let Some(oidn) = &self.oidn
+            {
+                ensure!(!oidn.failed, "{}", oidn.status);
+            }
+            let encoder = self.device.create_command_encoder(&Default::default());
+            export::start(&self.device, &self.queue, encoder, &self.texture, path)
+        }
     }
     fn save_texture_png(&self, texture: &wgpu::Texture, path: &Path) -> Result<()> {
         let row = (self.width * 4).div_ceil(256) * 256;
@@ -1062,49 +1375,61 @@ fn bindings(
     view: &wgpu::TextureView,
     frames: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
+    let mut entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: worlds[0].geometry.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: worlds[1].geometry.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: pixels.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 5,
+            resource: worlds[0].nodes.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 6,
+            resource: worlds[1].nodes.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 7,
+            resource: frames.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: wgpu::BindingResource::TextureView(view),
+        },
+    ];
+    if let (Some(a), Some(b)) = (&worlds[0].hardware, &worlds[1].hardware) {
+        entries.push(wgpu::BindGroupEntry {
+            binding: 8,
+            resource: wgpu::BindingResource::AccelerationStructure(&a.tlas),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 9,
+            resource: wgpu::BindingResource::AccelerationStructure(&b.tlas),
+        });
+    }
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("World resources"),
         layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: worlds[0].geometry.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: worlds[1].geometry.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: pixels.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: worlds[0].nodes.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: worlds[1].nodes.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: frames.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(view),
-            },
-        ],
+        entries: &entries,
     })
 }
 
 /// Geometry and acceleration are owned as a pair, so a scene upload cannot leave
 /// stale bounds referring to a different world's objects.
 struct GpuWorld {
+    hardware: Option<ray_query::World>,
     geometry: wgpu::Buffer,
     nodes: wgpu::Buffer,
     object_count: u32,
@@ -1114,18 +1439,34 @@ struct GpuWorld {
     light_count: u32,
     has_glass: bool,
     glass_targets: Vec<[f32; 4]>,
+    glass_spheres: Vec<[[f32; 4]; 2]>,
+    encoding_bounds: (glam::Vec3, glam::Vec3),
 }
 impl GpuWorld {
-    fn new(device: &wgpu::Device, objects: &[scene::Object]) -> Result<Self> {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, objects: &[scene::Object]) -> Result<Self> {
         let mut bvh = Bvh::build(objects)?;
         let node_count = bvh.nodes.len() as u32;
         let glass_targets = caustics::targets(objects, &bvh);
+        let encoding_bounds = bvh.nodes.iter().fold(
+            (glam::Vec3::splat(-8.), glam::Vec3::splat(8.)),
+            |(lo, hi), n| {
+                (
+                    lo.min(glam::Vec3::from_array(n.low)),
+                    hi.max(glam::Vec3::from_array(n.high)),
+                )
+            },
+        );
         let (objects, lights) = crate::sampling::prepare(objects);
         let light_count = lights.len() as u32;
         // Compact CDF records share the acceleration allocation after its nodes.
         // Traversal keeps its original logical count; no extra GPU bindings.
         bvh.nodes.extend(lights);
         let objects = objects.as_slice();
+        let hardware = ray_query::supported(device)
+            .then(|| {
+                ray_query::World::new(device, queue, objects, &mut bvh.nodes, node_count as usize)
+            })
+            .transpose()?;
         let limit = device
             .limits()
             .max_storage_buffer_binding_size
@@ -1157,12 +1498,20 @@ impl GpuWorld {
             usage: wgpu::BufferUsages::STORAGE,
         });
         Ok(Self {
+            hardware,
             geometry,
             nodes,
             object_count: objects.len() as u32,
             node_count,
             light_count,
             glass_targets,
+            encoding_bounds,
+            glass_spheres: objects
+                .iter()
+                .filter(|o| o.extent_shape[3] == 0. && o.color_material[3] >= 2.)
+                .take(4)
+                .map(|o| [o.center_radius, [o.color_material[3] - 2., 0., 0., 0.]])
+                .collect(),
             has_glass: objects.iter().any(|o| o.color_material[3] >= 2.),
             plane_count: bvh.plane_count,
             // Measured on the target M1: <=32 finite spheres are cheaper to

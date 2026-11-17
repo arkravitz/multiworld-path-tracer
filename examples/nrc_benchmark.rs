@@ -35,6 +35,9 @@ struct Args {
     /// Enable anchored bootstrapped training for the cached estimator.
     #[arg(long)]
     self_training: bool,
+    /// Compare the previous SIMD matrix path against native TensorOps.
+    #[arg(long)]
+    simd_neural: bool,
 }
 fn wait(r: &Renderer) -> Result<()> {
     r.device.poll(wgpu::PollType::Wait {
@@ -150,6 +153,7 @@ fn main() -> Result<()> {
         let base = Settings {
             worlds: [WorldPreset::SunkenTemple, WorldPreset::BioluminescentGrove],
             mode,
+            tensor_neural: !args.simd_neural,
             spp: 1,
             depth: if args.enclosed { 16 } else { 10 },
             distance: if args.enclosed { 8. } else { 18. },

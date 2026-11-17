@@ -5,6 +5,9 @@ struct CausticParams {
     targets:array<vec4<f32>,32>, // up to 16 caster bounds per world
     offsets:vec4<u32>, // photons/world, buckets/world, record offset, splat offset (words)
     shape:vec4<f32>, // gather radius, caster counts A/B, reserved
+    spheres:array<vec4<f32>,16>, // four (center/radius, IOR) pairs per world
+    learning:vec4<u32>, // frozen weights, contribution statistics, focus, reservoirs
+    features:vec4<u32>, // methods bitmask, active launch count, round, sphere counts
 }
 @group(1) @binding(0) var<storage,read_write> photon_data:array<atomic<u32>>;
 @group(1) @binding(1) var<uniform> caustics:CausticParams;
@@ -23,22 +26,23 @@ fn photon_bucket(cell:vec3<i32>,world:u32)->u32 {
 }
 // Splat power to a pinhole pixel using the receiver-area / pixel-solid-angle
 // Jacobian. Binning photon positions directly avoids a display-space blur.
-fn photon_splat(world:u32,p:vec3<f32>,n:vec3<f32>,color:vec3<f32>,flux:vec3<f32>,length:u32) {
-    if length>params.transport.y {return;}
+fn photon_splat(world:u32,p:vec3<f32>,n:vec3<f32>,color:vec3<f32>,flux:vec3<f32>,length:u32)->f32 {
+    if length>params.transport.y {return 0.0;}
     let delta=p-params.eye.xyz;let z=dot(delta,params.forward.xyz);
-    if z<=0.0 {return;}
+    if z<=0.0 {return 0.0;}
     let x=dot(delta,params.right.xyz)/(z*dot(params.right.xyz,params.right.xyz));
     let y=dot(delta,params.up.xyz)/(z*dot(params.up.xyz,params.up.xyz));
     let uv=vec2<f32>(0.5+0.5*x,0.5-0.5*y);
-    if any(uv<vec2<f32>(0.0)) || any(uv>=vec2<f32>(1.0)) {return;}
+    if any(uv<vec2<f32>(0.0)) || any(uv>=vec2<f32>(1.0)) {return 0.0;}
     let d2=dot(delta,delta);let direction=delta/sqrt(d2);let cosine=dot(n,-direction);
-    if cosine<=0.0 {return;}
-    if shadow_occluded(world,p+n*0.002,-direction,sqrt(d2)-0.004) {return;}
+    if cosine<=0.0 {return 0.0;}
+    if shadow_occluded(world,p+n*0.002,-direction,sqrt(d2)-0.004) {return 0.0;}
     let solid_angle=4.0*length_vector(params.right.xyz)*length_vector(params.up.xyz)*pow(z/sqrt(d2),3.0)/f32(params.size.x*params.size.y);
     let value=flux*color*(cosine/(PI*d2*solid_angle));
     let pixel=vec2<u32>(uv*vec2<f32>(params.size.xy));
     let index=caustics.offsets.w+(world*params.size.x*params.size.y+pixel.y*params.size.x+pixel.x)*3u;
     photon_add(index,value.x);photon_add(index+1u,value.y);photon_add(index+2u,value.z);
+    return dot(value,vec3<f32>(0.2126,0.7152,0.0722));
 }
 // Keep the parameter named 'length' above without hiding the builtin.
 fn length_vector(v:vec3<f32>)->f32 {return sqrt(dot(v,v));}
@@ -51,12 +55,17 @@ fn caustic_estimate(world:u32,p:vec3<f32>,n:vec3<f32>,color:vec3<f32>,bounce:u32
         let count=atomicLoad(&photon_data[bucket]);
         for(var i=0u;i<count;i++) {
             let id=atomicLoad(&photon_data[photon_indices()+start+i]);
-            let base=caustics.offsets.z+id*12u;let position=photon_vec(base);
+            let base=caustics.offsets.z+id*16u;let position=photon_vec(base);
             // A hash collision must never count a photon again in another cell.
             if all(photon_cell(position)==neighbor) && bounce+atomicLoad(&photon_data[base+9u])<=params.transport.y {
                 let delta=position-p;let plane=dot(delta,n);let d=length_vector(delta);
                 if d<radius && abs(plane)<radius*0.1 && dot(n,photon_vec(base+3u))>0.9 {
-                    flux+=photon_vec(base+6u)*(3.0*(1.0-d/radius)/(PI*radius*radius));
+                    let contribution=photon_vec(base+6u)*(3.0*(1.0-d/radius)/(PI*radius*radius));
+                    flux+=contribution;
+                    if (caustics.features.x&1u)!=0u {
+                        let cell=guide_cell(world,atomicLoad(&photon_data[base+12u]),atomicLoad(&photon_data[base+13u]));
+                        photon_add(caustics.learning.y+cell*2u+1u,min(1000.0,max(0.0,dot(contribution,vec3<f32>(0.2126,0.7152,0.0722)))));
+                    }
                 }
             }
         }
@@ -66,20 +75,21 @@ fn caustic_estimate(world:u32,p:vec3<f32>,n:vec3<f32>,color:vec3<f32>,bounce:u32
 @compute @workgroup_size(64)
 fn photon_clear(@builtin(global_invocation_id) id:vec3<u32>) {
     let index=id.x+id.y*65536u;
+    if index<caustics.offsets.x*2u {atomicStore(&photon_data[caustics.offsets.z+index*16u+11u],0u);}
     if index<caustics.offsets.y*2u {atomicStore(&photon_data[index],0u);}
     if index<params.size.x*params.size.y*6u {atomicStore(&photon_data[caustics.offsets.w+index],0u);}
 }
-@compute @workgroup_size(64)
-fn photon_trace(@builtin(global_invocation_id) id:vec3<u32>) {
-    let world=id.y;if id.x>=caustics.offsets.x {return;}
-    let photon=world*caustics.offsets.x+id.x;let record=caustics.offsets.z+photon*12u;
-    atomicStore(&photon_data[record+11u],0u);
-    if (params.transport.x==0u && world==1u)||(params.transport.x==1u && world==0u) {return;}
-    let count=select(params.lights.x,params.lights.y,world==1u);if count==0u {return;}
-    var rng=hash(id.x^hash(params.size.w+0x419b2e17u)^hash(params.transport.z)^hash(world+131u));
+struct LightSample {
+    position:vec3<f32>, normal:vec3<f32>, flux:vec3<f32>, color:vec3<f32>,
+    depth:u32, valid:u32, light:u32, caster:u32,
+}
+fn trace_light_sample(world:u32,seed:u32)->LightSample {
+    var result:LightSample;
+    let count=select(params.lights.x,params.lights.y,world==1u);if count==0u {return result;}
+    var rng=seed;
     let offset=select(params.acceleration.x,params.acceleration.y,world==1u);
-    let u=random(&rng);var low=0u;var high=count-1u;
-    loop {if low>=high {break;}let mid=(low+high)/2u;if u<node_at(world,offset+mid).low.x {high=mid;}else{low=mid+1u;}}
+    let low=sample_photon_light(world,count,&rng);
+    result.light=low;
     let light=object_at(world,node_at(world,offset+low).object);
     var ro:vec3<f32>;var normal:vec3<f32>;var area:f32;
     if light.extent.w<0.5 {
@@ -95,45 +105,26 @@ fn photon_trace(@builtin(global_invocation_id) id:vec3<u32>) {
         ro[a]+=(2.0*random(&rng)-1.0)*light.extent[a];ro[b]+=(2.0*random(&rng)-1.0)*light.extent[b];
     }
     let target_count=u32(select(caustics.shape.y,caustics.shape.z,world==1u));
-    // Retain full support outside the caster bounds. Overlapping target cones
-    // use the sum of ALL proposal PDFs, not only the chosen caster's density.
-    var rd=cosine_direction(normal*select(-1.0,1.0,random(&rng)<0.5),&rng);
-    if target_count>0u && random(&rng)<0.9 {
-        let chosen=min(u32(random(&rng)*f32(target_count)),target_count-1u);
-        let caster=caustics.targets[world*16u+chosen];let delta=caster.xyz-ro;
-        let axis=normalize(select(vec3<f32>(0.0,1.0,0.0),delta,dot(delta,delta)>1e-12));
-        rd=oriented_direction(axis,1.0-random(&rng)*caster_cone(caster,ro),2.0*PI*random(&rng));
-    }
-    let cosine=abs(dot(rd,normal));if cosine<=0.0 {return;}
-    var pdf=cosine/(2.0*PI);
-    if target_count>0u {
-        pdf*=0.1;
-        for(var target_index=0u;target_index<target_count;target_index++) {
-            let caster=caustics.targets[world*16u+target_index];let delta=caster.xyz-ro;
-            let axis=normalize(select(vec3<f32>(0.0,1.0,0.0),delta,dot(delta,delta)>1e-12));
-            let cone=caster_cone(caster,ro);
-            if dot(rd,axis)>=1.0-cone {pdf+=0.9/(f32(target_count)*2.0*PI*cone);}
-        }
-    }
-    var flux=light.emission.xyz*(area*cosine/(light.emission.w*pdf*f32(caustics.offsets.x)));
+    let chosen=sample_photon_caster(world,low,target_count,&rng);
+    result.caster=chosen;
+    let proposal=emission_direction(world,low,target_count,chosen,ro,normal,&rng);
+    var rd=proposal.xyz;let pdf=proposal.w;
+    let cosine=abs(dot(rd,normal));if cosine<=0.0 || pdf<=0.0 {return result;}
+    var flux=light.emission.xyz*(area*cosine/(photon_light_pdf(world,low,count)*pdf));
     ro+=normal*select(-0.002,0.002,dot(rd,normal)>0.0);
     var medium_active=false;var medium_color=vec3<f32>(1.0);var medium_ior=1.0;
     var may_start_inside=false;
     for(var i=0u;i<target_count;i++) {let bound=caustics.targets[world*16u+i];if dot(ro-bound.xyz,ro-bound.xyz)<=bound.w*bound.w {may_start_inside=true;}}
     if may_start_inside && (params.lights.w&(1u<<world))!=0u {let boundary=glass_boundary(world,ro,rd);if boundary.t<1e29 && boundary.front<0.5 {medium_active=true;medium_color=boundary.color;medium_ior=boundary.metal-2.0;}}
     for(var depth=0u;depth+2u<=params.transport.y;depth++){
-        let hit=intersect(world,ro,rd);if hit.t>1e29 {return;}
+        let hit=intersect(world,ro,rd);if hit.t>1e29 {return result;}
         if medium_active {flux*=pow(clamp(medium_color,vec3<f32>(0.0),vec3<f32>(1.0)),vec3<f32>(hit.t));}
         let p=ro+hit.t*rd;
         if hit.metal<=0.5 {
-            if depth==0u {return;} // Direct lighting remains exclusively camera MIS.
-            let base=record;
-            photon_write(base,p);photon_write(base+3u,hit.normal);photon_write(base+6u,flux);
-            atomicStore(&photon_data[base+9u],depth+2u);
-            let bucket=photon_bucket(photon_cell(p),world);
-            atomicAdd(&photon_data[bucket],1u);
-            atomicStore(&photon_data[base+10u],bucket);atomicStore(&photon_data[base+11u],1u);
-            photon_splat(world,p,hit.normal,hit.color,flux,depth+2u);return;
+            if depth==0u {return result;} // Direct lighting remains exclusively camera MIS.
+            result.position=p;result.normal=hit.normal;result.flux=flux;
+            result.color=hit.color;result.depth=depth+2u;result.valid=1u;
+            return result;
         }
         var transmitted=false;
         if hit.metal>=2.0 {
@@ -147,6 +138,7 @@ fn photon_trace(@builtin(global_invocation_id) id:vec3<u32>) {
         }else{rd=reflect(rd,hit.normal);flux*=hit.color;}
         ro=p+select(0.002,-0.002,transmitted)*hit.normal;
     }
+    return result;
 }
 
 fn caustic_visible(index:u32,world:u32)->vec3<f32> {
@@ -163,7 +155,7 @@ fn caster_cone(caster:vec4<f32>,ro:vec3<f32>)->f32 {
 // replace linked-list pointer chasing with contiguous ranges, without a cap.
 fn photon_offsets()->u32 {return caustics.offsets.y*2u;}
 fn photon_blocks()->u32 {return caustics.offsets.y*4u;}
-fn photon_indices()->u32 {return caustics.offsets.z+caustics.offsets.x*24u;}
+fn photon_indices()->u32 {return caustics.offsets.z+caustics.offsets.x*32u;}
 var<workgroup> photon_scan:array<u32,256>;
 fn photon_inclusive_scan(lane:u32) {
     workgroupBarrier();
@@ -188,9 +180,11 @@ fn photon_scan_blocks(@builtin(local_invocation_index) lane:u32) {
 @compute @workgroup_size(64)
 fn photon_scatter(@builtin(global_invocation_id) id:vec3<u32>) {
     if id.x>=caustics.offsets.x*2u {return;}
-    let record=caustics.offsets.z+id.x*12u;if atomicLoad(&photon_data[record+11u])==0u {return;}
+    let record=caustics.offsets.z+id.x*16u;if atomicLoad(&photon_data[record+11u])==0u {return;}
     let bucket=atomicLoad(&photon_data[record+10u]);
     let start=atomicLoad(&photon_data[photon_offsets()+bucket])+atomicLoad(&photon_data[photon_blocks()+bucket/256u]);
     let index=atomicAdd(&photon_data[bucket],1u);
     atomicStore(&photon_data[photon_indices()+start+index],id.x);
 }
+
+fn photon_nrc_ready()->bool {return false;}

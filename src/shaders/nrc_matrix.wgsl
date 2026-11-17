@@ -81,16 +81,17 @@ fn neural_resolve_matrix(lane:u32)->vec3<f32> {
 // blend's two slots update disjoint a/b fields, with no shared component writes.
 @compute @workgroup_size(32)
 fn neural_resolve_queries(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_index) lane:u32) {
+    let query_index=id.x+id.y*65535u*32u;
     let slots=select(1u,2u,ACTIVE_MODE==2u);
-    let live=id.x<params.size.x*params.size.y*slots;
+    let live=query_index<params.size.x*params.size.y*slots;
     neural_pending=false;
-    if live {neural_pending_sample=neural_queries[id.x];neural_pending=neural_pending_sample.label.w>0.0;}
+    if live {neural_pending_sample=neural_queries[query_index];neural_pending=neural_pending_sample.label.w>0.0;}
     let prediction=neural_resolve_matrix(lane);
     if !neural_pending {return;}
-    let index=id.x/slots;let color=neural_pending_sample.label.xyz*prediction;
-    neural_queries[id.x].label=vec4<f32>(color,1.0);
+    let index=query_index/slots;let color=neural_pending_sample.label.xyz*prediction;
+    neural_queries[query_index].label=vec4<f32>(color,1.0);
     let delta=adaptive_luma(color);let prefix=neural_pending_sample.albedo.w;
-    if slots==2u && (id.x&1u)!=0u {
+    if slots==2u && (query_index&1u)!=0u {
         let count=max(1.0,pixels[index].b.w);let old=pixels[index].moment_b;
         pixels[index].moment_b=vec4<f32>(old.xyz+color/count,max(0.0,old.w+2.0*delta*(prefix-adaptive_luma(old.xyz))+delta*delta*(1.0-1.0/count)));
         if (pixels[index].counts.y&1u)==1u {pixels[index].half_b+=vec4<f32>(color,0.0);}

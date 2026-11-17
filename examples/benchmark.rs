@@ -106,6 +106,7 @@ fn main() -> Result<()> {
         linear.use_bvh = false;
         let mut forced = base.clone();
         forced.adaptive_bvh = false;
+        forced.hardware_ray_tracing = false;
         // Exercise all paths before timing and synchronize actual completion.
         run(&mut r, &linear, 8, true)?;
         run(&mut r, &linear, 8, false)?;

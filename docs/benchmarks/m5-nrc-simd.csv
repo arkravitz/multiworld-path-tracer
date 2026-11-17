@@ -1,0 +1,3 @@
+mode,raw_spp,warmup_batches,reference_spp,reference_ms,path_ms,nrc_ms,path_mse,nrc_mse
+01-world-a,32,128,256,256.864,30.948,43.403,0.00109848,0.00102252
+05-per-bounce,32,128,256,199.306,25.822,41.241,0.00174863,0.00155794

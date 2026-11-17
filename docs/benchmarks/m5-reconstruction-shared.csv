@@ -1,0 +1,6 @@
+method,camera_spp,seconds,raw_nrmse,reconstructed_nrmse,display_rmse,min_pixel_paths,max_pixel_paths
+raw-uniform,516,2.012594,0.044388,0.044388,0.046568,516,516
+temporal-uniform,460,2.002842,0.045047,0.075419,0.048611,460,460
+oidn-uniform,492,2.013514,0.044606,0.048693,0.044067,492,492
+oidn-variance,400,2.015766,0.045191,0.049082,0.044146,95,547
+oidn-aware,372,2.045686,0.045155,0.048610,0.044103,137,729

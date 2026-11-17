@@ -1,6 +1,6 @@
 # Targeted light tracing and progressive caustics
 
-Enable **Fast glass caustics (experimental)**, or click **Glass & caustics showcase**. The option works in World A, World B and Image-space blend. Other transport modes use the original camera estimator. The showcase also enables OIDN and denoising-aware adaptive camera sampling; choose uniform sampling and turn denoising off, or export raw PNGs, when comparing estimator variants.
+Open the **Glass & caustics** workspace and enable **Fast glass caustics (experimental)**. The option works in World A, World B and Image-space blend. Other transport modes use the original camera estimator. The workspace defaults to learned photon launches, OIDN and uniform camera sampling; turn denoising off, or export raw PNGs, when comparing estimator variants.
 
 ```sh
 cargo run --release -- --mode world-a --world-a glass-gallery --caustics --bounces 20
@@ -11,7 +11,7 @@ cargo run --release --example caustics_benchmark -- --seconds 3 --reference-samp
 
 ## Estimator
 
-Each camera sample launches **4,096–32,768 light paths per active world**. The budget scales with image size (the next power of two above one quarter of its pixel count, clamped to that range), so small previews do not pay the full light-pass cost. Sphere and box emitter positions are sampled uniformly over surface area, and emitters are selected by the existing power CDF. Emission is two-sided, matching the reference renderer. The direction proposal mixes 90% caster-bound cones with 10% unguided cosine emission. Each analytic glass object has a target; consecutive glass triangles form a mesh target, up to 16 bounds per world. Overlapping cones use the full mixture PDF. The unguided component retains support for specular chains outside those bounds, including mirrors.
+Each camera sample launches **4,096–32,768 light paths per active world**. The budget scales with image size (the next power of two above one quarter of its pixel count, clamped to that range), so small previews do not pay the full light-pass cost. Sphere and box emitter positions are sampled uniformly over surface area, and emitters are selected by the existing power CDF. Emission is two-sided, matching the reference renderer. The glass workspace and CLI `--caustics` enable feedback-guided light/caster selection by default; `--no-photon-guiding` restores the power-weighted light / uniform-caster reference described here. [Advanced methods and measurements](advanced-caustics.md) document normalized manifold proposals and weighted reservoir reuse, which remain off by default. The direction proposal mixes 90% caster-bound cones with 10% unguided cosine emission. Each analytic glass object has a target; consecutive glass triangles form a mesh target, up to 16 bounds per world. An independent photon budget can override automatic sizing (nonzero values clamp to 256–32,768). Overlapping cones use the full mixture PDF. The unguided component retains support for specular chains outside those bounds, including mirrors.
 
 Light paths use exact dielectric Fresnel probabilities, Beer absorption and importance transport, without the radiance-mode eta-squared factor. They follow specular surfaces until the first diffuse landing. Light selection, emission area/direction PDFs and the number of launched paths all appear in the flux weight. Truncated and escaped paths contribute zero; normalization is by launched paths, never by successful landings.
 
@@ -28,7 +28,7 @@ The light estimator owns camera paths containing a diffuse receiver followed by 
 
 The neural cache is bypassed while fast caustics is active. Its full diffuse-lighting predictions overlap the photon contribution; combining them needs a separately trained residual or a different estimator partition. Display denoising still works.
 
-The stochastic world-switching modes need an adjoint world-transition law for light paths. Independent per-world maps do not supply that law, so those modes explicitly fall back to the reference. This implementation is not ReSTIR BDPT, Specular Manifold Sampling or Guided ReSTIR FG+: it implements the targeted light-tracing / gathering recommendation from the [research survey](caustics-research.md).
+The stochastic world-switching modes need an adjoint world-transition law for light paths. Independent per-world maps do not supply that law, so those modes explicitly fall back to the reference. The optional methods now add bounded sphere manifold-guided emission and weighted light-path reservoir reuse. They are not full SMS, ReSTIR BDPT or Guided ReSTIR FG+ ports; the underlying estimator remains the targeted light-tracing / gathering partition from the [research survey](caustics-research.md).
 
 Current limits include finite sphere/box emitters, smooth RGB glass, non-overlapping closed dielectric volumes and finite-kernel reconstruction. Gathering can soften small details or leak between sufficiently close, similarly oriented surfaces. Faceted geometry retains its actual optical facets. Turning the option off restores the original estimator for comparisons.
 

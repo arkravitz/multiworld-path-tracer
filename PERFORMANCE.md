@@ -1,5 +1,7 @@
 # Rendering performance and release build
 
+For the M5 Max upgrades and current paired benchmarks, see [Apple Silicon acceleration](docs/m5-acceleration.md). The measurements below retain the original M1 baseline.
+
 Measured on Apple M1 / Metal, November 10, 2026. Release build, seed 42, depth 10, p=0.5, s=0.8. Three warmed rounds with rotating order and explicit GPU completion waits. No concurrent benchmark render jobs were launched. Normal desktop activity and thermal variation can affect timings.
 
 The reference uses the original primitive/linear intersection loop, with the common transport-mode specialization also enabled. The optimized path includes candidate-distance queries and automatic per-world BVH selection. Both columns defer display until the final sample. These ratios isolate query improvements; they do not claim to compare every change against the November 9 executable.

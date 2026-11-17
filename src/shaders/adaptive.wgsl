@@ -18,6 +18,12 @@ fn adaptive_prefix_u(lane:u32) {
     }
 }
 fn adaptive_luma(v:vec3<f32>)->f32 {return dot(v,vec3<f32>(0.2126,0.7152,0.0722));}
+fn adaptive_bin(endpoint:f32,jitter:f32)->u32 {
+    // floor(endpoint+jitter) loses the strict jitter<1 bound when the endpoint
+    // is large: 196608+.9977968 rounds to 196609. Compare fractional parts
+    // instead, so the final integer endpoint always closes the exact budget.
+    return u32(floor(endpoint))+select(0u,1u,jitter>=1.0-fract(endpoint));
+}
 fn adaptive_signal(mean:vec4<f32>, count:f32, cost:f32, prior:f32)->f32 {
     let standard=sqrt(max(0.0,mean.w)/max(1.0,count-1.0));
     var signal=standard;
@@ -73,7 +79,7 @@ fn adaptive_allocate(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_
         var upper=right;if id.x+1u==n {upper=f32(n);}
         if params.size.w<u32(params.reconstruction.z) {upper=f32(id.x+1u);left=f32(id.x);}
         let jitter=f32(hash(params.transport.z^hash(params.size.w)^0x38f96be5u)>>8u)*(1.0/16777216.0);
-        count=u32(floor(upper+jitter))-u32(floor(left+jitter));
+        count=adaptive_bin(upper,jitter)-adaptive_bin(left,jitter);
         pixels[id.x].schedule.x=count;pixels[id.x].schedule.y=bitcast<u32>(max(1e-6,upper-left));
         // Add predictable control variates to EVERY pixel, even an inactive one.
         // Active rays later add inverse-rate-weighted residuals. This avoids the

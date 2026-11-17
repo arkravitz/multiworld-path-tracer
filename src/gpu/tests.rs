@@ -100,6 +100,8 @@ fn queries_with_policy(r: &Renderer, probes: &[Probe], policy: u32) -> Vec<Probe
         r.worlds[0].plane_count,
         r.worlds[1].plane_count,
     ];
+    params.lights[0] = r.worlds[0].light_count;
+    params.lights[1] = r.worlds[1].light_count;
     dispatch_probes(r, probes, &params, "probe_queries")
 }
 fn dispatch_probes(r: &Renderer, probes: &[Probe], params: &Params, entry: &str) -> Vec<Probe> {
@@ -139,33 +141,36 @@ fn dispatch_probes(r: &Renderer, probes: &[Probe], params: &Params, entry: &str)
     let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Actual integrator query equivalence"),
         source: wgpu::ShaderSource::Wgsl(
-            format!(
-                "{}\n{}\n{}\n{}\n{}\n{PROBE_SHADER}",
-                if entry == "probe_matrix" {
-                    "enable wgpu_cooperative_matrix;"
-                } else {
-                    ""
-                },
-                concat!(
+            ray_query::shader(
+                &r.device,
+                format!(
+                    "{}\n{}\n{}\n{}\n{}\n{PROBE_SHADER}",
+                    if entry == "probe_matrix" {
+                        "enable wgpu_cooperative_matrix;"
+                    } else {
+                        ""
+                    },
                     concat!(
-                        include_str!("../shaders/trace.wgsl"),
+                        concat!(
+                            include_str!("../shaders/trace.wgsl"),
+                            "\n",
+                            include_str!("../shaders/adaptive.wgsl")
+                        ),
                         "\n",
-                        include_str!("../shaders/adaptive.wgsl")
+                        include_str!("../shaders/caustics_stub.wgsl")
                     ),
-                    "\n",
-                    include_str!("../shaders/caustics_stub.wgsl")
+                    include_str!("../shaders/nrc.wgsl"),
+                    if entry == "probe_matrix" {
+                        include_str!("../shaders/nrc_queued.wgsl")
+                    } else {
+                        ""
+                    },
+                    if entry == "probe_matrix" {
+                        include_str!("../shaders/nrc_matrix.wgsl")
+                    } else {
+                        include_str!("../shaders/nrc_scalar.wgsl")
+                    }
                 ),
-                include_str!("../shaders/nrc.wgsl"),
-                if entry == "probe_matrix" {
-                    include_str!("../shaders/nrc_queued.wgsl")
-                } else {
-                    ""
-                },
-                if entry == "probe_matrix" {
-                    include_str!("../shaders/nrc_matrix.wgsl")
-                } else {
-                    include_str!("../shaders/nrc_scalar.wgsl")
-                }
             )
             .into(),
         ),
@@ -297,6 +302,13 @@ fn bvh_gpu_queries_match_linear_for_both_worlds_and_edge_cases() {
                 scene::WorldPreset::NeonDistrict,
             ],
         ),
+        scene::selected_worlds(
+            42,
+            [
+                scene::WorldPreset::GlassGallery,
+                scene::WorldPreset::CrystalGarden,
+            ],
+        ),
         [vec![], vec![]],
         [vec![object([0.; 3], 2., [0.5; 3])], vec![]],
     ];
@@ -337,6 +349,9 @@ fn bvh_gpu_queries_match_linear_for_both_worlds_and_edge_cases() {
         rays.push(probe(Vec3::ZERO, Vec3::new(1e-9, 0., 1.), 0));
         assert_queries(&queries(&r, &rays));
         assert_queries(&queries_with_policy(&r, &rays, 4));
+        if r.hardware_ray_tracing_available() {
+            assert_queries(&queries_with_policy(&r, &rays, 48));
+        }
         total += rays.len() * 2;
     }
     // A rejected second world must leave BOTH previous worlds/resources intact.
@@ -996,7 +1011,14 @@ fn read_neural_header(r: &Renderer) -> [u32; 4] {
 fn fused_neural_training_fits_world_conditioned_held_out_targets() {
     let (device, queue) = pollster::block_on(headless_device()).unwrap();
     let mut r = Renderer::new(device, queue, 8, 8, 42).unwrap();
-    let mut neural = nrc::Neural::new(&r.device, &r.shader, &r.layout, r.width, r.height);
+    let mut neural = nrc::Neural::new(
+        &r.device,
+        &r.shader,
+        &r.layout,
+        r.width,
+        r.height,
+        r.trace_group_y,
+    );
     let mut encoder = r.device.create_command_encoder(&Default::default());
     neural.initialize(&mut encoder, &r.bind_group);
     r.queue.submit([encoder.finish()]);
@@ -1355,7 +1377,14 @@ fn cooperative_neural_inference_matches_scalar_and_handles_partial_tiles() {
         return;
     }
     let mut r = Renderer::new(device, queue, 28, 19, 42).unwrap();
-    let mut neural = nrc::Neural::new(&r.device, &r.shader, &r.layout, r.width, r.height);
+    let mut neural = nrc::Neural::new(
+        &r.device,
+        &r.shader,
+        &r.layout,
+        r.width,
+        r.height,
+        r.trace_group_y,
+    );
     let mut encoder = r.device.create_command_encoder(&Default::default());
     neural.initialize(&mut encoder, &r.bind_group);
     r.queue.submit([encoder.finish()]);
@@ -1432,7 +1461,14 @@ fn queued_neural_render_matches_scalar_in_all_world_modes_and_guides() {
         return;
     }
     let mut r = Renderer::new(device, queue, 28, 19, 42).unwrap();
-    let mut neural = nrc::Neural::new(&r.device, &r.shader, &r.layout, r.width, r.height);
+    let mut neural = nrc::Neural::new(
+        &r.device,
+        &r.shader,
+        &r.layout,
+        r.width,
+        r.height,
+        r.trace_group_y,
+    );
     let mut encoder = r.device.create_command_encoder(&Default::default());
     neural.initialize(&mut encoder, &r.bind_group);
     r.queue.submit([encoder.finish()]);
@@ -2581,4 +2617,945 @@ fn adaptive_gpu_scheduler_uses_denoised_error_not_only_raw_variance() {
         ratios[1] > 3.,
         "denoised-error sampling did not use reconstruction uncertainty: {ratios:?}"
     );
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn advanced_caustic_proposals_preserve_energy_and_reset_reuse() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 32, 24, 42).unwrap();
+    let floor = Object {
+        center_radius: [0.; 4],
+        extent_shape: [0., 0., 0., 2.],
+        color_material: [0.75, 0.75, 0.75, 0.],
+        emission: [0.; 4],
+    };
+    let sphere = Object {
+        center_radius: [0., 1.6, 0., 0.9],
+        extent_shape: [0.; 4],
+        color_material: [0.85, 0.95, 0.99, 3.5],
+        emission: [0.; 4],
+    };
+    let light = Object {
+        center_radius: [0., 6.5, 0., 0.3],
+        extent_shape: [0.; 4],
+        color_material: [0.; 4],
+        emission: [100., 100., 100., 0.],
+    };
+    r.set_worlds(&[vec![floor, sphere, light], vec![]]).unwrap();
+    let mut settings = Settings {
+        mode: Mode::WorldA,
+        caustics: true,
+        photon_budget: 4096,
+        depth: 12,
+        yaw: 0.,
+        pitch: 0.7,
+        distance: 8.,
+        ..Default::default()
+    };
+    let diagnostics = |r: &Renderer| -> [u32; 8] {
+        let c = r.caustics.as_ref().unwrap();
+        let stage = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Caustic method diagnostics"),
+            size: 32,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = r.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&c.data, c.diagnostic_offset, &stage, 0, 32);
+        bytemuck::pod_read_unaligned(&r.read_buffer(encoder, &stage).unwrap())
+    };
+    let mut baseline = 0.;
+    for (guided, reuse, manifold) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        settings.photon_guiding = guided;
+        settings.photon_reuse = reuse;
+        settings.manifold_guiding = manifold;
+        r.reset();
+        for _ in 0..128 {
+            r.accumulate(&settings);
+            r.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(Duration::from_secs(60)),
+                })
+                .unwrap();
+        }
+        let pixels = r.read_pixels().unwrap();
+        let energy = pixels
+            .iter()
+            .map(|p| p.light_a[..3].iter().sum::<f32>() as f64)
+            .sum::<f64>()
+            / (pixels.len() * 3 * r.samples as usize) as f64;
+        let d = diagnostics(&r);
+        eprintln!(
+            "Caustic methods guided={guided},reuse={reuse},manifold={manifold}: visible energy {energy}, diagnostics {d:?}"
+        );
+        assert!(
+            pixels
+                .iter()
+                .all(|p| p.a.iter().chain(&p.light_a).all(|v| v.is_finite()))
+        );
+        if !guided && !reuse && !manifold {
+            baseline = energy;
+            assert!(baseline > 0.001);
+        } else {
+            assert!(
+                (energy / baseline - 1.).abs() < 0.2,
+                "energy ratio {}",
+                energy / baseline
+            );
+        }
+        if manifold {
+            assert!(
+                d[0] > 0 && d[1] > 0,
+                "Newton transmission proposals must actually converge"
+            );
+        }
+        if reuse {
+            assert!(d[2] > 0, "reservoir sources must actually be reused");
+        }
+    }
+    // A reset invalidates both reservoir banks and the learned manifold focus.
+    r.reset();
+    r.accumulate(&settings);
+    let reset = diagnostics(&r);
+    assert_eq!(reset[0], 0);
+    assert_eq!(reset[2], 0);
+    assert_eq!(r.samples, 1);
+    // A non-power-of-two launch count and a different budget remain normalized.
+    settings.photon_budget = 777;
+    r.accumulate(&settings);
+    assert_eq!(
+        r.samples, 1,
+        "changing light budget restarts both estimators"
+    );
+    assert_eq!(diagnostics(&r)[2], 0);
+    // Two caster proposals must learn distinct probabilities from real
+    // contributions; a feature switch that leaves every proposal uniform fails.
+    let mut far = sphere;
+    far.center_radius[0] = 6.;
+    r.set_worlds(&[vec![floor, sphere, far, light], vec![]])
+        .unwrap();
+    settings.photon_guiding = true;
+    settings.photon_reuse = false;
+    settings.manifold_guiding = false;
+    settings.photon_budget = 2048;
+    for _ in 0..48 {
+        r.accumulate(&settings);
+    }
+    let c = r.caustics.as_ref().unwrap();
+    let stage = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Learned caster probabilities"),
+        size: 8,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = r.device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(&c.data, c.diagnostic_offset + 32 + 1024 * 4, &stage, 0, 8);
+    let probability: [f32; 2] =
+        bytemuck::pod_read_unaligned(&r.read_buffer(encoder, &stage).unwrap());
+    eprintln!("Learned caster probabilities {probability:?}");
+    assert!((probability.iter().sum::<f32>() - 1.).abs() < 1e-5);
+    assert!((probability[0] - 0.5).abs() > 0.03);
+    assert!(probability.iter().all(|p| *p >= 0.099));
+    // Beyond the bounded guide table, both light AND caster PDFs must use the
+    // baseline; a zero cached caster PDF would brighten the cone proposal.
+    let mut many = vec![floor, sphere];
+    for i in 0..33 {
+        let mut l = light;
+        l.center_radius[0] = (i as f32 - 16.) * 0.7;
+        l.center_radius[3] = 0.15;
+        many.push(l);
+    }
+    r.set_worlds(&[many, vec![]]).unwrap();
+    let mut images = Vec::new();
+    for guided in [false, true] {
+        settings.photon_guiding = guided;
+        r.reset();
+        for _ in 0..16 {
+            r.accumulate(&settings);
+        }
+        images.push(r.read_pixels().unwrap());
+    }
+    let difference = images[0]
+        .iter()
+        .zip(&images[1])
+        .flat_map(|(a, b)| (0..3).map(move |c| (a.a[c] - b.a[c]).abs()))
+        .fold(0_f32, f32::max);
+    assert!(
+        difference < 0.0001,
+        "bounded-table fallback changed radiance: {difference}"
+    );
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn oidn_live_display_holds_export_quality_while_new_raw_samples_arrive() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let r = Renderer::new(device, queue, 4, 4, 42).unwrap();
+    let denoiser = oidn::Oidn::new(&r.device, &r.shader, &r.layout, [4, 4]);
+    let snapshot = oidn::Feedback {
+        color_a: [0.2, 0.5, 0.8, 8.],
+        raw_a: [0.1, 0.2, 0.4, -1.],
+        color_b: [0.8, 0.4, 0.1, 8.],
+        raw_b: [0.5, 0.3, 0.1, -1.],
+    };
+    r.queue.write_buffer(
+        denoiser.output_buffer(),
+        0,
+        bytemuck::cast_slice(&[snapshot; 16]),
+    );
+    let stage = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Live OIDN display regression"),
+        size: 256 * 4,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let show = |params: &Params, values: &[Pixel]| {
+        r.queue
+            .write_buffer(&r.uniform, 0, bytemuck::bytes_of(params));
+        r.queue
+            .write_buffer(&r.pixels, 0, bytemuck::cast_slice(values));
+        let mut encoder = r.device.create_command_encoder(&Default::default());
+        denoiser.present(&mut encoder, &r.bind_group);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &r.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &stage,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(4),
+                },
+            },
+            r.texture.size(),
+        );
+        let bytes = r.read_buffer(encoder, &stage).unwrap();
+        bytes
+            .as_chunks::<256>()
+            .0
+            .iter()
+            .flat_map(|row| row[..16].iter().copied())
+            .collect::<Vec<_>>()
+    };
+    for mode in [Mode::WorldA, Mode::WorldB, Mode::Blend] {
+        for strength in [0., 0.8, 1.] {
+            let mut params = Params::zeroed();
+            params.size = [4, 4, 0, 8];
+            params.transport = [mode as u32, 20, 42, View::Radiance as u32];
+            params.controls = [0.35, 0.8, 0., 0.];
+            params.reconstruction[0] = strength;
+            let mut original = [Pixel::zeroed(); 16];
+            for p in &mut original {
+                for c in 0..3 {
+                    p.a[c] = snapshot.raw_a[c] * 8.;
+                    p.b[c] = snapshot.raw_b[c] * 8.;
+                }
+            }
+            let finished_export = show(&params, &original);
+            // Eight newer, deliberately noisy samples arrive during OIDN work.
+            // Both raw sums and the global sample count change; feedback does not.
+            let mut current = original;
+            for (i, p) in current.iter_mut().enumerate() {
+                for c in 0..3 {
+                    p.a[c] += if (i + c) % 2 == 0 { 12. } else { 0. };
+                    p.b[c] += if (i + c) % 2 == 0 { 0. } else { 20. };
+                }
+            }
+            params.size[3] = 16;
+            let live = show(&params, &current);
+            assert_eq!(
+                live, finished_export,
+                "{mode:?}, strength {strength}: raw samples leaked into the reconstructed display"
+            );
+            assert!(finished_export.iter().step_by(4).any(|v| *v > 0));
+            // Exposure remains responsive without replacing the completed image.
+            params.controls[2] = 1.;
+            assert_ne!(show(&params, &current), live);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn interactive_glass_work_stays_bounded_when_ui_outpaces_gpu() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 800, 600, 42).unwrap();
+    let settings = Settings {
+        mode: Mode::WorldA,
+        worlds: [
+            scene::WorldPreset::GlassGallery,
+            scene::WorldPreset::CrystalGarden,
+        ],
+        caustics: true,
+        photon_guiding: true,
+        denoise: true,
+        depth: 20,
+        yaw: 0.6,
+        pitch: 0.55,
+        distance: 13.,
+        ..Default::default()
+    };
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut submitted = 0;
+    let mut worst_backlog = 0;
+    let mut first_submit = Duration::ZERO;
+    for frame in 0..24 {
+        let started = std::time::Instant::now();
+        if r.render_live(&settings, true) {
+            submitted += 1;
+            let completed = completed.clone();
+            r.queue.on_submitted_work_done(move || {
+                completed.fetch_add(1, Ordering::Release);
+            });
+        }
+        if frame == 0 {
+            first_submit = started.elapsed();
+        }
+        r.device.poll(wgpu::PollType::Poll).unwrap();
+        worst_backlog = worst_backlog.max(submitted - completed.load(Ordering::Acquire));
+    }
+    let wait = std::time::Instant::now();
+    r.device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(60)),
+        })
+        .unwrap();
+    eprintln!(
+        "Live glass: first submit {first_submit:?}, submissions {submitted}, maximum GPU backlog {worst_backlog}, queued drain {:?}",
+        wait.elapsed()
+    );
+    assert!(
+        worst_backlog <= 1,
+        "UI input accumulated behind {worst_backlog} full glass frames"
+    );
+    assert_eq!(r.samples as usize, submitted);
+    // Once completed, a new render and pending settings changes can progress.
+    assert!(r.render_live(&settings, true));
+}
+
+#[test]
+#[ignore = "requires installed OIDN runtime and Metal GPU"]
+fn asynchronous_image_exports_match_sync_without_resetting_accumulation() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 32, 24, 42).unwrap();
+    let settings = Settings {
+        mode: Mode::WorldA,
+        denoise: true,
+        spp: 8,
+        ..Default::default()
+    };
+    r.set_worlds(&[vec![], vec![]]).unwrap();
+    r.render(&settings, true);
+    r.finish_denoising(&settings).unwrap();
+    let raw = r.read_pixels().unwrap();
+    let count = r.samples;
+    let dir = std::env::temp_dir().join(format!("multiworld-async-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    r.save_png(&dir.join("sync.png")).unwrap();
+    r.save_raw_png(&dir.join("sync-raw.png")).unwrap();
+    let filtered = r.start_image_export(&dir.join("async.png"), false).unwrap();
+    let unfiltered = r
+        .start_image_export(&dir.join("async-raw.png"), true)
+        .unwrap();
+    assert_eq!(r.samples, count);
+    assert_eq!(
+        bytemuck::cast_slice::<Pixel, u8>(&raw),
+        bytemuck::cast_slice::<Pixel, u8>(&r.read_pixels().unwrap())
+    );
+    // Camera work can continue after the copied snapshot is queued; PNG
+    // encoding owns its data and must not accidentally export the newer image.
+    r.accumulate(&settings);
+    assert_eq!(r.samples, count + 8);
+    let wait = |job: super::export::ImageExport| {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(result) = job.poll() {
+                result.unwrap();
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30));
+            r.device.poll(wgpu::PollType::Poll).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    wait(filtered);
+    wait(unfiltered);
+    for (a, b) in [("sync.png", "async.png"), ("sync-raw.png", "async-raw.png")] {
+        assert_eq!(
+            std::fs::read(dir.join(a)).unwrap(),
+            std::fs::read(dir.join(b)).unwrap()
+        );
+    }
+    let invalid = r.start_image_export(&dir, false).unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(result) = invalid.poll() {
+            assert!(result.is_err());
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30));
+        r.device.poll(wgpu::PollType::Poll).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn photon_nrc_sppc_targets_match_direct_lighting_and_keep_query_lifetimes() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 19, 13, 42).unwrap();
+    let floor = Object {
+        center_radius: [0.; 4],
+        extent_shape: [0., 0., 0., 2.],
+        color_material: [0.8, 0.8, 0.8, 0.],
+        emission: [0.; 4],
+    };
+    let light = Object {
+        center_radius: [0., 4., 0., 0.7],
+        extent_shape: [0.; 4],
+        color_material: [0.; 4],
+        emission: [10., 10., 10., 0.],
+    };
+    r.set_worlds(&[vec![floor, light], vec![]]).unwrap();
+    let s = Settings {
+        mode: Mode::WorldA,
+        photon_nrc: true,
+        photon_nrc_queries: 1024,
+        photon_nrc_hash_log2: 10,
+        photon_nrc_photons: 8192,
+        photon_nrc_global_radius: 0.5,
+        photon_nrc_caustic_radius: 0.2,
+        depth: 8,
+        yaw: 0.,
+        pitch: 0.9,
+        distance: 6.,
+        ..Default::default()
+    };
+    for _ in 0..80 {
+        r.accumulate(&s);
+        r.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(60)),
+            })
+            .unwrap();
+    }
+    let cache = r.photon_nrc.as_ref().unwrap();
+    let read = |offset: u64, len: u64| {
+        let stage = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("SPPC validation"),
+            size: len,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = r.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&cache.data, offset, &stage, 0, len);
+        r.read_buffer(encoder, &stage).unwrap()
+    };
+    let state: [u32; 4] = bytemuck::pod_read_unaligned(&read(0, 16));
+    assert_eq!(state[0], 80 * 8192);
+    assert!(state[2] >= 32);
+    let queries = read(cache.query_offset(), 1024 * 128);
+    let mut actual = 0_f64;
+    let mut expected = 0_f64;
+    let mut matched = 0;
+    let mut shrunk = 0;
+    for bytes in queries.as_chunks::<128>().0 {
+        let q: [[f32; 4]; 8] = bytemuck::pod_read_unaligned(bytes);
+        if q[6][3].to_bits() == 0 {
+            continue;
+        }
+        let age = state[0].wrapping_sub(q[6][2].to_bits());
+        assert!(age > 0 && age <= 51 * 8192, "incorrect ring lifetime {age}");
+        if q[6][0] < 0.25 {
+            shrunk += 1;
+        }
+        let p = Vec3::from_array(q[0][..3].try_into().unwrap());
+        if p.y.abs() > 0.001 || p.x * p.x + p.z * p.z > 9. {
+            continue;
+        }
+        let d2 = p.x * p.x + p.z * p.z + 16.;
+        let factor = 0.49 * 4. / d2.powf(1.5);
+        let target = 0.8 * (10. * factor + 0.045 * (1. - factor));
+        let value = (q[4][0] / q[6][0] + q[5][0] / q[6][1]) / (std::f32::consts::PI * age as f32)
+            + q[7][0] / q[7][3].max(1.);
+        assert!(value.is_finite() && value >= 0.);
+        actual += value as f64;
+        expected += target as f64;
+        matched += 1;
+    }
+    eprintln!(
+        "SPPC: state {state:?}, {matched} analytic queries, target ratio {}, {shrunk} shrinking global radii",
+        actual / expected
+    );
+    assert!(matched > 20 && shrunk > 0);
+    assert!(
+        (actual / expected - 1.).abs() < 0.2,
+        "photon target normalization ratio {}",
+        actual / expected
+    );
+    assert!(
+        r.read_pixels()
+            .unwrap()
+            .iter()
+            .all(|p| p.a.iter().all(|v| v.is_finite()))
+    );
+    let hash_offset = 4_495_936;
+    let weights = read(hash_offset, 32 * 1024 * 4);
+    let largest = weights
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b).abs())
+        .fold(0_f32, f32::max);
+    assert!(largest > 0.001, "hash features were not trained: {largest}");
+    cache.verify_matrix_predictions(&r);
+    let batches = r.photon_nrc_batches();
+    r.clear_accumulation();
+    r.accumulate(&s);
+    assert_eq!(
+        r.photon_nrc_batches(),
+        batches + 1,
+        "camera/image reset must retain query learning"
+    );
+    r.reset();
+    r.accumulate(&s);
+    assert_eq!(r.photon_nrc_batches(), 1);
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn photon_nrc_glass_caustics_and_blend_worlds_are_isolated() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 16, 12, 42).unwrap();
+    let floor = Object {
+        center_radius: [0.; 4],
+        extent_shape: [0., 0., 0., 2.],
+        color_material: [0.8, 0.8, 0.8, 0.],
+        emission: [0.; 4],
+    };
+    let glass = Object {
+        center_radius: [0., 1.5, 0., 0.7],
+        extent_shape: [0.; 4],
+        color_material: [1., 1., 1., 3.5],
+        emission: [0.; 4],
+    };
+    let light = Object {
+        center_radius: [0., 4., 0., 0.7],
+        extent_shape: [0.; 4],
+        color_material: [0.; 4],
+        emission: [10., 10., 10., 0.],
+    };
+    r.set_worlds(&[vec![floor, glass, light], vec![floor, glass]])
+        .unwrap();
+    let s = Settings {
+        mode: Mode::Blend,
+        photon_nrc: true,
+        photon_nrc_queries: 1024,
+        photon_nrc_hash_log2: 10,
+        photon_nrc_photons: 8192,
+        photon_nrc_global_radius: 0.5,
+        photon_nrc_caustic_radius: 0.25,
+        depth: 12,
+        yaw: 0.,
+        pitch: 0.9,
+        distance: 6.,
+        ..Default::default()
+    };
+    for _ in 0..64 {
+        r.accumulate(&s);
+        r.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(60)),
+            })
+            .unwrap();
+    }
+    let cache = r.photon_nrc.as_ref().unwrap();
+    let stage = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("SPPC world isolation"),
+        size: 1024 * 128,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut e = r.device.create_command_encoder(&Default::default());
+    e.copy_buffer_to_buffer(&cache.data, cache.query_offset(), &stage, 0, 1024 * 128);
+    let bytes = r.read_buffer(e, &stage).unwrap();
+    let mut caustic = 0_f64;
+    let mut counts = [0; 2];
+    for bytes in bytes.as_chunks::<128>().0 {
+        let q: [[f32; 4]; 8] = bytemuck::pod_read_unaligned(bytes);
+        if q[6][3].to_bits() == 0 {
+            continue;
+        }
+        let world = q[0][3] as usize;
+        counts[world] += 1;
+        if world == 0 {
+            caustic += q[5][0] as f64;
+        } else {
+            assert_eq!(q[4], [0.; 4]);
+            assert_eq!(q[5], [0.; 4]);
+        }
+    }
+    assert!(counts.iter().all(|n| *n > 50), "{counts:?}");
+    assert!(caustic > 0., "glass never trained caustic queries");
+    let pixels = r.read_pixels().unwrap();
+    assert!(
+        pixels
+            .iter()
+            .all(|p| p.a.iter().chain(&p.b).all(|x| x.is_finite()))
+    );
+    assert!(
+        pixels.iter().any(|p| p.b[0] > 0.),
+        "environment in unlit world B disappeared"
+    );
+}
+
+#[test]
+#[ignore = "requires Metal compute adapter"]
+fn photon_nrc_camera_orbit_preserves_ground_shadow_contrast() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 64, 48, 42).unwrap();
+    let floor = Object {
+        center_radius: [0.; 4],
+        extent_shape: [0., 0., 0., 2.],
+        color_material: [0.8, 0.8, 0.8, 0.],
+        emission: [0.; 4],
+    };
+    let block = Object {
+        center_radius: [0., 0.8, 0., 0.],
+        extent_shape: [0.5, 0.8, 0.5, 1.],
+        color_material: [0., 0., 0., 0.],
+        emission: [0.; 4],
+    };
+    let light = Object {
+        center_radius: [-1.5, 4., 0., 0.3],
+        extent_shape: [0.; 4],
+        color_material: [0.; 4],
+        emission: [100., 100., 100., 0.],
+    };
+    let glass = Object {
+        center_radius: [1.5, 0.7, 0., 0.6],
+        extent_shape: [0.; 4],
+        color_material: [1., 1., 1., 3.5],
+        emission: [0.; 4],
+    };
+    r.set_worlds(&[vec![floor, block, light, glass], vec![]])
+        .unwrap();
+    let mut s = Settings {
+        mode: Mode::WorldA,
+        photon_nrc: true,
+        photon_nrc_queries: 2048,
+        photon_nrc_hash_log2: 14,
+        photon_nrc_photons: 32768,
+        depth: 12,
+        yaw: -0.8,
+        pitch: 0.9,
+        distance: 6.,
+        ..Default::default()
+    };
+    let wait = |r: &Renderer| {
+        r.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(60)),
+            })
+            .unwrap();
+    };
+    for _ in 0..40 {
+        r.accumulate(&s);
+        wait(&r);
+    }
+    s.yaw = 1.2;
+    r.accumulate(&s);
+    wait(&r);
+    let immediate = r.read_pixels().unwrap();
+    for _ in 0..63 {
+        r.accumulate(&s);
+        wait(&r);
+    }
+    let settled = r.read_pixels().unwrap();
+    s.photon_nrc = false;
+    s.spp = 8;
+    for _ in 0..32 {
+        r.accumulate(&s);
+        wait(&r);
+    }
+    let reference = r.read_pixels().unwrap();
+    for (stage, cached) in [
+        ("first orbit image", immediate),
+        ("corrected cache image", settled),
+    ] {
+        let mut shadow = [0_f64; 3];
+        let mut lit = [0_f64; 3];
+        for (c, p) in cached.iter().zip(&reference) {
+            if p.normals_a[1] / p.a[3] < 0.99 {
+                continue;
+            }
+            let actual = (c.a[0] / c.a[3]) as f64;
+            let expected = (p.a[0] / p.a[3]) as f64;
+            let target = if expected < 0.075 {
+                &mut shadow
+            } else if expected > 0.3 && expected < 0.8 {
+                &mut lit
+            } else {
+                continue;
+            };
+            target[0] += actual;
+            target[1] += expected;
+            target[2] += 1.;
+        }
+        assert!(
+            shadow[2] > 10. && lit[2] > 10.,
+            "missing ground regions: {shadow:?} {lit:?}"
+        );
+        let ratio =
+            (lit[0] / lit[2] - shadow[0] / shadow[2]) / (lit[1] / lit[2] - shadow[1] / shadow[2]);
+        eprintln!("{stage}: orbit shadow contrast ratio {ratio}, shadow {shadow:?}, lit {lit:?}");
+        assert!(
+            ratio > 0.7,
+            "{stage}: orbit erased ground shadow contrast: {ratio}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Metal compute adapter"]
+fn photon_nrc_corrected_caustic_energy_survives_camera_orbit() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 32, 24, 42).unwrap();
+    let floor = Object {
+        center_radius: [0.; 4],
+        extent_shape: [0., 0., 0., 2.],
+        color_material: [0.75, 0.75, 0.75, 0.],
+        emission: [0.; 4],
+    };
+    let lens = Object {
+        center_radius: [0., 1.6, 0., 0.9],
+        extent_shape: [0.; 4],
+        color_material: [1., 1., 1., 3.5],
+        emission: [0.; 4],
+    };
+    let light = Object {
+        center_radius: [0., 6.5, 0., 0.3],
+        extent_shape: [0.; 4],
+        color_material: [0.; 4],
+        emission: [100., 100., 100., 0.],
+    };
+    r.set_worlds(&[vec![floor, lens, light], vec![]]).unwrap();
+    let mut s = Settings {
+        mode: Mode::WorldA,
+        photon_nrc: true,
+        photon_nrc_queries: 1024,
+        photon_nrc_hash_log2: 10,
+        photon_nrc_photons: 8192,
+        depth: 12,
+        yaw: -0.8,
+        pitch: 0.9,
+        distance: 6.,
+        ..Default::default()
+    };
+    let wait = |r: &Renderer| {
+        r.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(60)),
+            })
+            .unwrap();
+    };
+    for _ in 0..40 {
+        r.accumulate(&s);
+        wait(&r);
+    }
+    s.yaw = 1.2;
+    for _ in 0..16 {
+        r.accumulate(&s);
+        wait(&r);
+    }
+    let [reference, corrected] = r.photon_nrc.as_ref().unwrap().caustic_probe_means(&r);
+    eprintln!("After orbit, ground caustic: reference {reference}, corrected cache {corrected}");
+    assert!(reference > 2., "fixture did not focus light");
+    assert!(
+        (corrected / reference - 1.).abs() < 0.15,
+        "cache lost focused caustic energy"
+    );
+}
+
+#[test]
+#[ignore = "requires hardware ray-query adapter"]
+fn hardware_ray_query_single_sphere() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 8, 8, 42).unwrap();
+    assert!(r.hardware_ray_tracing_available());
+    r.set_worlds(&[vec![object([0.; 3], 0., [1., 0., 0.])], vec![]])
+        .unwrap();
+    let rays = [probe(Vec3::new(0., 0., -3.), Vec3::Z, 0)];
+    assert_queries(&queries_with_policy(&r, &rays, 48));
+}
+
+#[test]
+#[ignore = "requires hardware ray-query adapter"]
+fn hardware_ray_query_build_order_preserves_translated_emitters() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 8, 8, 42).unwrap();
+    let scenes = scene::worlds(42);
+    let rays = [probe(
+        Vec3::new(-10.618146, 4.6591196, -2.3284006),
+        Vec3::new(0.9945289, -0.0023215641, 0.10443557),
+        0,
+    )];
+    for scene in [
+        vec![scenes[0][26]],
+        vec![scenes[0][0], scenes[0][26]],
+        scenes[0][1..].to_vec(),
+        scenes[0].clone(),
+    ] {
+        r.set_worlds(&[scene, vec![]]).unwrap();
+        assert_queries(&queries_with_policy(&r, &rays, 48));
+    }
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn optional_acceleration_features_have_a_real_software_fallback() {
+    let instance = wgpu::Instance::new(instance_descriptor());
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("Portable fallback verification"),
+        ..Default::default()
+    }))
+    .unwrap();
+    let mut r = Renderer::new(device, queue, 28, 19, 42).unwrap();
+    assert!(!r.hardware_ray_tracing_available());
+    let s = Settings {
+        spp: 3,
+        ..Default::default()
+    };
+    r.accumulate(&s);
+    let a = r.read_pixels().unwrap();
+    r.reset();
+    r.accumulate(&Settings {
+        hardware_ray_tracing: false,
+        ..s.clone()
+    });
+    assert_pixels(
+        &a,
+        &r.read_pixels().unwrap(),
+        "Optional ray-query feature fallback",
+    );
+    for photon in [false, true] {
+        let s = Settings {
+            mode: Mode::WorldA,
+            neural_cache: !photon,
+            photon_nrc: photon,
+            spp: 1,
+            ..s.clone()
+        };
+        r.reset();
+        r.accumulate(&s);
+        assert!(
+            r.read_linear_image(&s, false)
+                .unwrap()
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite())
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn trace_workgroup_variants_preserve_partial_tiles_and_reconstruction_inputs() {
+    let mut reference: Option<Vec<Vec<Pixel>>> = None;
+    for group_y in [8, 4, 16, 32] {
+        let (device, queue) = pollster::block_on(headless_device()).unwrap();
+        let mut r = Renderer::new_with_workgroup(device, queue, 28, 19, 42, group_y).unwrap();
+        let mut images = Vec::new();
+        for mode in [Mode::WorldA, Mode::Blend, Mode::PerBounce] {
+            for denoise in [false, true] {
+                let s = Settings {
+                    mode,
+                    spp: 3,
+                    denoise,
+                    denoiser: crate::settings::DenoiserKind::Temporal,
+                    ..Default::default()
+                };
+                r.reset();
+                r.render(&s, true);
+                images.push(r.read_pixels().unwrap());
+            }
+        }
+        if let Some(reference) = &reference {
+            for (a, b) in images.iter().zip(reference) {
+                assert_pixels(a, b, "Trace workgroup and partial tile equivalence");
+            }
+        } else {
+            reference = Some(images);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Metal/Vulkan/DX12 compute adapter"]
+fn adaptive_large_image_preserves_budget_across_scan_chunks() {
+    let (device, queue) = pollster::block_on(headless_device()).unwrap();
+    let mut r = Renderer::new(device, queue, 512, 384, 42).unwrap();
+    r.set_worlds(&[vec![], vec![]]).unwrap();
+    let s = Settings {
+        mode: Mode::WorldA,
+        sampling: crate::settings::SamplingMode::Variance,
+        spp: 1,
+        ..Default::default()
+    };
+    for _ in 0..16 {
+        r.accumulate(&s);
+    }
+    let mut pixels = r.read_pixels().unwrap();
+    for (i, p) in pixels.iter_mut().enumerate() {
+        p.moment_a[3] = if i % 512 < 256 { 1600. } else { 0. };
+        p.stats_a[3] = 16.;
+    }
+    r.queue
+        .write_buffer(&r.pixels, 0, bytemuck::cast_slice(&pixels));
+    // At this real progressive index, jitter=.9977968. Adding it to the
+    // 196608-ray endpoint rounds to 196609 in f32. Replay that phase without
+    // tracing the intervening 145 rounds; physical path counts stay separate.
+    r.samples = 161;
+    for round in 0..24 {
+        r.accumulate(&s);
+        let pixels = r.read_pixels().unwrap();
+        let schedules = pixels.iter().map(|p| u64::from(p.schedule[0])).sum::<u64>();
+        let actual = pixels.iter().map(|p| u64::from(p.counts[0])).sum::<u64>();
+        let expected = pixels.len() as u64 * (17 + round as u64);
+        let guards = pixels.iter().map(|p| u64::from(p.counts[2])).sum::<u64>();
+        assert_eq!(
+            schedules,
+            pixels.len() as u64,
+            "round {round}: allocation sum, actual camera paths {actual}, expected {expected}, guards {guards}"
+        );
+        assert_eq!(
+            actual, expected,
+            "round {round}: compaction/tracing lost paths; guards {guards}"
+        );
+    }
 }

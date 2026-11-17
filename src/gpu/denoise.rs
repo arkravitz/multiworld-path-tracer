@@ -18,7 +18,8 @@ struct FilterParams {
     controls: [f32; 4],
 }
 pub(super) struct Denoiser {
-    pub trace: [wgpu::ComputePipeline; 6],
+    trace: [wgpu::ComputePipeline; 6],
+    trace_hardware: Option<[wgpu::ComputePipeline; 6]>,
     pipeline: wgpu::ComputePipeline,
     uniform: wgpu::Buffer,
     groups: [wgpu::BindGroup; 2],
@@ -29,6 +30,13 @@ pub(super) struct Denoiser {
     previous: Option<Settings>,
 }
 impl Denoiser {
+    pub fn trace_pipeline(&self, mode: usize, hardware: bool) -> &wgpu::ComputePipeline {
+        &(if hardware {
+            self.trace_hardware.as_ref().unwrap()
+        } else {
+            &self.trace
+        })[mode]
+    }
     pub fn new(
         device: &wgpu::Device,
         width: u32,
@@ -36,20 +44,30 @@ impl Denoiser {
         shader: &wgpu::ShaderModule,
         base: &wgpu::BindGroupLayout,
         trace_layout: &wgpu::PipelineLayout,
+        trace_group_y: u32,
     ) -> Self {
-        let trace = std::array::from_fn(|mode| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Denoiser input trace"),
-                layout: Some(trace_layout),
-                module: shader,
-                entry_point: Some("accumulate"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &[("ACTIVE_MODE", mode as f64), ("DENOISE_INPUT", 1.)],
-                    ..Default::default()
-                },
-                cache: None,
+        let traces = |hardware: bool| {
+            std::array::from_fn(|mode| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("Denoiser input trace"),
+                    layout: Some(trace_layout),
+                    module: shader,
+                    entry_point: Some("accumulate"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[
+                            ("ACTIVE_MODE", mode as f64),
+                            ("DENOISE_INPUT", 1.),
+                            ("TRACE_GROUP_Y", trace_group_y as f64),
+                            ("HARDWARE_QUERIES", f64::from(hardware)),
+                        ],
+                        ..Default::default()
+                    },
+                    cache: None,
+                })
             })
-        });
+        };
+        let trace = traces(false);
+        let trace_hardware = super::ray_query::supported(device).then(|| traces(true));
         let history = std::array::from_fn(|_| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Dual-world denoising history"),
@@ -109,6 +127,7 @@ impl Denoiser {
         });
         Self {
             trace,
+            trace_hardware,
             pipeline,
             uniform,
             groups,

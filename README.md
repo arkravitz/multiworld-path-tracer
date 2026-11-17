@@ -1,8 +1,53 @@
-# Multiworld stochastic path tracer
+# Multiworld path tracer · two rendering labs
 
-A Rust + WGSL research playground that samples incompatible worlds during light transport. All intersections and path integration run in a **wgpu compute shader**. The interactive egui application uses eframe's winit window and shares its GPU device; headless mode runs the identical integrator without a window.
+A GPU rendering playground with two workspaces: **Multiworld** explores light traveling between incompatible worlds; **Glass & caustics** explores refraction, colored glass and focused light. Both use the same Rust + WGSL rendering engine, scene representation, acceleration structures, material system and image reconstruction tools.
 
-Choose each world independently from eight presets. The app opens with a warm **Sunken temple** and a cool **Bioluminescent grove**. Switch either dropdown, swap A/B, or choose a suggested pairing without restarting. Every world shares the same coordinate space, so geometry, reflections and illumination can cross between them. Geometry and sampling are reproducible from an explicit integer seed.
+The app opens in Multiworld with a warm **Sunken temple** and a cool **Bioluminescent grove**. Switch to Glass & caustics for the tessellated Utah Teapot and Suzanne crystal garden. The split gives each experiment its own controls and defaults while keeping the underlying renderer shared.
+
+## Two labs, one rendering engine
+
+Use the **Multiworld** and **Glass & caustics** tabs at the top of the sidebar. Each workspace remembers its own scene choices, camera, materials and render settings for the current session. Switching restores those choices and restarts image accumulation; resolution and export location remain shared.
+
+| Workspace | The experiment | What you control |
+| --- | --- | --- |
+| **Multiworld** | What happens when a light path can change worlds? A tree can borrow another world's illumination, and a reflection can encounter geometry absent from the camera's world. | Two worlds, six transport modes, spatial probability, primary-world locking and optional neural radiance caching. Opens with Temple × grove. |
+| **Glass & caustics** | How do we efficiently sample light that bends through glass and concentrates into bright patterns? | Scene A, Scene B or an independent image blend; glass types, photon caustics and reconstruction. Opens with the close teapot view, 20 bounces, **learned photon launches**, OIDN and **uniform sampling**, selected from the equal-time comparisons. |
+
+| Multiworld · shared space, different realities | Glass & caustics · refraction and focused light |
+| --- | --- |
+| <img src="docs/images/combos/15-two-realities.png" width="400" alt="Multiworld experiment: silver orbital rings and a golden planet intersect a cyan and magenta city"> | <img src="docs/images/glass/01-faceted-teapot.png" width="400" alt="Glass experiment: a faceted transparent Utah Teapot refracts the scene and casts focused light onto stone"> |
+
+These are existing renderer captures; their settings are documented in the [world-collision gallery](docs/combo-gallery.md) and [glass section](#glass-tessellated-meshes-and-caustics) below. They illustrate the two experiments, rather than an equal-time comparison.
+
+Glass meshes remain selectable in Multiworld for cross-world experiments. The fast photon estimator belongs to the Glass & caustics workspace and supports fixed worlds or independent image blends. The older camera-trained neural cache belongs to Multiworld. Glass also offers a separate photon-trained neural cache, described below. The workspaces expose these supported combinations directly.
+
+**Reset glass showcase** restores the glass workspace defaults. Adaptive sampling remains an option in both workspaces. Explicit fixed-world/blend `--caustics` launches open the glass workspace; headless transport options retain their existing behavior. Workspace choices are kept in memory, not saved across app launches.
+
+## What the engine shares
+
+Both labs trace paths through the same geometry and materials, accumulate linear light, and use the same display and export pipeline. The interesting common pieces are:
+
+- **GPU traversal and light transport.** Intersections, material scattering and path integration run in wgpu compute shaders. Each world has its own BVH in shared coordinates; the engine supports spheres, boxes, capsules, ellipsoids and embedded triangle meshes. Metal runs this on Apple Silicon, with Vulkan/DX12 backends on supported platforms.
+- **A common material and lighting system.** Diffuse surfaces, tinted mirrors and smooth glass share the integrator. Glass includes Fresnel reflection/refraction, total internal reflection and distance-based colored absorption. Power-weighted area-light sampling and multiple importance sampling help paths find illumination.
+- **Reconstruction that understands what is visible through glass.** Optional OIDN runs on Metal on Apple Silicon. Its normal/albedo guides follow reflection and refraction to the surfaces beyond the glass, with absorption included. Reconstruction stays separate from raw accumulation, so filtered and raw exports can be compared.
+- **A GPU scheduler that spends rays where they matter.** Uniform, variance-based and denoising-aware sampling share the same camera tracer. Adaptive modes build compact ray queues on the GPU under a fixed total camera-path budget; the ray-allocation view shows the actual distribution. Extra scheduling and reconstruction work can outweigh the benefit in short runs, so adaptive sampling is optional.
+- **One path from interaction to measurement.** The egui application shares the rendering GPU device; headless jobs run the same integrator without a window. Seeded scenes and sampling, raw linear readback, debug views and reproducible equal-time benchmarks make it possible to test whether an optimization improves the image.
+
+The specialized experiments build on that foundation: Multiworld changes which scene a path queries, while the glass estimator adds light-launched paths and photon gathering. The optional neural cache learns approximate diffuse continuation in Multiworld. Their scope and bias differ; a faster-looking preview alone does not establish a more accurate light-transport estimate.
+
+## Apple Silicon acceleration
+
+On supported GPUs, the renderer now uses **native ray queries** for traversal and
+mesh candidates. On M5, both optional neural caches can use **Metal TensorOps**,
+and OIDN shares native Metal buffers without image readback/re-upload. Small
+sphere scenes keep their faster software path automatically; other devices retain
+the existing compute/SIMD fallbacks.
+
+On this M5 Max, the 512×384 paired benchmark measured **2.54× faster teapot camera
+tracing**, **2.21× with photon caustics**, and **2.74× for Suzanne**. The default
+64-thread workgroup was retained after testing alternatives. The larger tests
+also found and fixed a one-ray adaptive-budget rounding error. [Implementation,
+measurement limits, controls and reproduction commands](docs/m5-acceleration.md).
 
 ## World collisions
 
@@ -62,7 +107,7 @@ These are raw GPU captures at 400×300, 256 spp, seed 42; denoising is off. Thes
 
 </details>
 
-Use **World A** and **World B** at the top of the sidebar. **Swap A ↔ B** swaps the selected scenes while preserving the current probability, camera and transport settings. **Suggested pairings** includes Temple × grove, Observatory × neon and the original pair. Selections work in all six transport modes, with spatial probability, primary-A locking, BVHs, MIS and denoising. Changing a preset resets raw accumulation and temporal history, including while paused; changing the seed regenerates the selected presets. Choosing the same preset in both slots produces identical worlds.
+In the **Multiworld** workspace, choose **World A** and **World B** independently from the eight presets. Both occupy the same coordinate space. **Swap A ↔ B** swaps the selected scenes while preserving the current probability, camera and transport settings. **Suggested pairings** includes Temple × grove, Observatory × neon and the original pair. Selections work in all six transport modes, with spatial probability, primary-A locking, BVHs, MIS and denoising. Changing a preset resets raw accumulation and temporal history, including while paused; changing the seed regenerates the selected presets. Choosing the same preset in both slots produces identical worlds.
 
 ```sh
 cargo run --release -- --world-a lunar-observatory --world-b neon-district
@@ -119,7 +164,7 @@ cargo run --release --example gallery -- --output output/gallery
 
 ## Glass, tessellated meshes and caustics
 
-Click **Glass & caustics showcase** to frame the online Utah Teapot and Suzanne scenes. The button selects a close camera, 20 bounces, **Fast glass caustics**, **OIDN**, and **Adaptive · denoised error**. Each world has its own glass selector: clear glass, borosilicate, flint crystal, diamond, amber, emerald, sapphire, or water-like refraction. The curated palette keeps a mix of materials within a scene.
+Open the **Glass & caustics** workspace to frame the online Utah Teapot and Suzanne scenes. Its **Composition** list selects Scene A, Scene B or a blend of two independently rendered scenes. **Reset glass showcase** selects a close camera, 20 bounces, **Fast glass caustics**, **Learn useful photon launches**, **OIDN**, and **Uniform** camera sampling. Each scene has its own glass selector: clear glass, borosilicate, flint crystal, diamond, amber, emerald, sapphire, or water-like refraction. The curated palette keeps a mix of materials within a scene.
 
 | Faceted Utah Teapot · clear glass | Suzanne · emerald crystal |
 | --- | --- |
@@ -135,6 +180,10 @@ cargo run --release --example glass_gallery -- --samples 1024
 ```
 
 On Apple M1 at 512×384 and roughly eight seconds, the teapot comparison has **18% lower full-image error** and **24% lower floor error** with fast caustics. This is a raw, equal-time comparison against a finite camera-path reference; tiny previews can trade reflection quality for cleaner caustics.
+
+The glass workspace also offers **Manifold-guided spheres**, **Reuse successful light paths**, and an independent **Photon budget**. The sphere option solves two-interface transmission paths to guide finite emission cones; it does not implement general mesh SMS. Reuse applies weighted temporal/pool reservoir resampling, rather than the full ReSTIR FG+ architecture. All eight combinations were measured: learned launches alone won the teapot test, so they are enabled by default; the other two remain experimental and off. [Algorithms, energy checks, captures and all-combination measurements](docs/advanced-caustics.md).
+
+**Photon-driven neural cache (paper)** adds SPPC from [Photon-Driven Neural Radiance Caching](https://doi.org/10.1145/3807895.3807923): persistent global/caustic photon queries train a multiresolution hash encoding and two 64-wide neural layers. Fused Metal matrix inference predicts diffuse continuations, including receivers seen through glass. Continued path corrections preserve shadows and fine caustics when the prediction is inaccurate, and camera movement gets an uncached preview while retaining the trained model. It is an optional alternative to Fast glass caustics; guided photons remain the default. [How to try it, paper differences, raw captures and measurements](docs/photon-driven-radiance-cache.md).
 
 [Fast caustics: implementation, scope and benchmark](docs/fast-caustics.md) · [Glass behavior, validation and limitations](docs/glass-and-caustics.md) · [Online mesh sources and attribution](assets/README.md).
 
@@ -153,13 +202,13 @@ The default render size is 800×600, independent of the window size. Start small
 cargo run --release -- --width 640 --height 480 --spp 1
 ```
 
-Drag the image to orbit; scroll over it to zoom. Horizontal rotation wraps continuously in either direction. The Orbit control under Camera & resolution is an unlimited degree drag field, so it has no blocking endpoint. Controls provide independent World A/B presets, suggested pairings, world swapping, automatic BVH acceleration (with forced-BVH and linear reference options), all six modes, mixture probability, persistence, samples per frame, maximum depth, exposure in stops, seed, pause/resume, reset, PNG export, debug views, spatial probability, primary-world lock, camera sliders, and render dimensions. Open **Camera & resolution** and click **Apply resolution** to resize. The status area displays frame rate, accumulated spp, resolution, GPU, and backend. FPS is application presentation cadence, not a GPU timing query.
+Drag the image to orbit; scroll over it to zoom. Horizontal rotation wraps continuously in either direction. The Orbit control under Camera & resolution is an unlimited degree drag field, so it has no blocking endpoint. Controls provide independent World A/B presets, suggested pairings, world swapping, automatic BVH acceleration (with forced-BVH and linear reference options), all six modes, mixture probability, persistence, samples per frame, maximum depth, exposure in stops, seed, pause/resume, reset, PNG export, debug views, spatial probability, primary-world lock, camera sliders, and render dimensions. Open **Camera & resolution** and click **Apply resolution** to resize. The status area displays frame rate, accumulated spp, resolution, GPU, and backend. **UI FPS** is application presentation cadence, not a GPU timing query. Heavy paths keep at most one progressive job in flight so camera/settings changes cannot sit behind many queued glass frames; interactive jobs use one sample at a time. Headless sample budgets are unchanged.
 
-PNG captures normally go to `captures/` relative to the working directory. Finder-launched macOS app bundles use `Pictures/Multiworld Path Tracer` in your home folder. Expand **Export folder** to choose another location, or set `MULTIWORLD_CAPTURE_DIR` before launch. They match the displayed view, including exposure or debug visualization. Exports and tests read images back to the CPU; OIDN also stages snapshots asynchronously through a background worker. Pausing preserves the estimates; display controls still work. Changing the seed regenerates both scenes as well as restarting the sample stream.
+PNG captures normally go to `captures/` relative to the working directory. Finder-launched macOS app bundles use `Pictures/Multiworld Path Tracer` in your home folder. Expand **Export folder** to choose another location, or set `MULTIWORLD_CAPTURE_DIR` before launch. They match the selected view, including exposure or debug visualization. Interactive exports prepare a current snapshot, then read back and write PNGs in the background; changing settings while preparation is pending cancels that export. Exports and tests read images back to the CPU; OIDN also stages snapshots asynchronously through a background worker. Pausing preserves the estimates; display controls still work. Changing the seed regenerates both scenes as well as restarting the sample stream.
 
 ## Experimental neural radiance caching
 
-An optional online neural cache, based on [Müller et al.'s SIGGRAPH 2021 paper](https://research.nvidia.com/labs/rtr/publication/muller2021nrc/), can replace longer diffuse path continuations. Enable **Neural radiance cache (experimental)** in the sidebar, or use `--neural-cache`; `--cache-bounce 1` tries earlier termination. It starts after a learning warm-up, conditions predictions on world identity and remaining depth, and preserves the ordinary handling of mirrors and local emission.
+An optional online neural cache, based on [Müller et al.'s SIGGRAPH 2021 paper](https://research.nvidia.com/labs/rtr/publication/muller2021nrc/), can replace longer diffuse path continuations. Enable **Neural radiance cache (experimental)** in the **Multiworld** sidebar, or use `--neural-cache`; `--cache-bounce 1` tries earlier termination. It starts after a learning warm-up, conditions predictions on world identity and remaining depth, and preserves the ordinary handling of mirrors and local emission.
 
 The compact 32→32→32→3 MLP batches ray queries into a coherent GPU queue and evaluates the complete network with fused Metal SIMD matrix operations on supported Apple GPUs, with a scalar fallback. Training uses parallel 128-example minibatches, four Adam updates per rendering dispatch, and separate EMA rendering weights. Automatic path-spread termination follows the paper's criterion. The model learns from separate teachers. An optional **Shorter training paths** mode uses bootstrapped targets with 1/16 uncached anchors, guided by NVIDIA’s public NRC integration code. Fully traced teachers remain the default because self-training can increase approximation error. NRC remains a **biased, diffuse-only adaptation**, defaulting off. On M1 it is about 1.7–1.9× faster than the initial serialized cache prototype in the open-scene test. In a separate enclosed, shadow-heavy room it beats ordinary tracing by 4.7× in World A and 1.12× in per-bounce transport after warm-up; ordinary tracing still wins on short, open paths. See the measured settings and error comparisons before choosing a mode.
 
@@ -178,7 +227,7 @@ cargo run --offline --example export_nrc_metal -- --cooperative
 
 ## Denoising and adaptive sampling
 
-Enable **Denoise** and select **OIDN · high quality**. OIDN runs on Metal on Apple Silicon; its guides follow reflections/refractions to the surfaces visible through glass, with colored absorption. The worker runs asynchronously while rendering continues, and PNG export waits for a current reconstruction. The old temporal filter remains available as **Temporal · legacy**.
+Enable **Denoise** and select **OIDN · high quality**. OIDN runs on Metal on Apple Silicon; its guides follow reflections/refractions to the surfaces visible through glass, with colored absorption. The worker runs asynchronously while rendering continues. The live view holds the latest completed reconstruction at the same denoise strength used by export, so newer unfinished raw samples do not leak speckle back into it. PNG export finishes a current reconstruction without blocking the UI. The old temporal filter remains available as **Temporal · legacy**.
 
 Source builds can install the optional native runtime with:
 
@@ -191,9 +240,9 @@ The installer pins OIDN 2.5.1 and verifies its download checksum. Its Metal back
 
 The **Sampling** list offers **Uniform**, **Adaptive · noise**, and **Adaptive · denoised error**. Both adaptive modes build a compact work queue on the GPU and keep a fixed total camera-path budget, spending more paths on uncertain pixels. The latter uses disagreement between OIDN reconstructions of two sample sets, with raw-variance and exploration safeguards. **View → Ray allocation** shows where paths went. Adaptive spp is an average: individual pixels receive different counts. Photon caustics keep their independent normalization.
 
-Denoising remains approximate and can soften fine glass or caustic detail; use the strength slider and raw export to compare. Small previews and short runs can spend more on reconstruction than they gain from adaptive allocation. The default reference settings remain uniform and unfiltered. The showcase button selects the new combination for exploration. Changing reconstruction strength/backend preserves raw accumulation; changing sampling policy restarts it.
+Denoising remains approximate and can soften fine glass or caustic detail; use the strength slider and raw export to compare. Small previews and short runs can spend more on reconstruction than they gain from adaptive allocation. The default reference settings remain uniform and unfiltered. The glass workspace defaults to uniform OIDN; choose adaptive sampling explicitly to explore its tradeoffs. Changing reconstruction strength/backend preserves raw accumulation; changing sampling policy restarts it.
 
-[Implementation, mathematical accounting, validation and measurements](docs/reconstruction-and-adaptive-sampling.md).
+[Live display and responsiveness fixes](docs/live-display-and-responsiveness.md) · [Implementation, mathematical accounting, validation and measurements](docs/reconstruction-and-adaptive-sampling.md) · [Research on faster glass convergence and the next estimator upgrade](docs/glass-convergence-research.md).
 
 In an approximately eight-second Apple M1 glass-scene comparison, OIDN reduced display-space error by 36% versus raw and 22% versus the legacy filter. Uniform OIDN beat both adaptive modes in that short test; adaptive allocation remains available to explore longer runs and other scenes.
 
@@ -325,7 +374,7 @@ cargo clippy --all-targets -- -D warnings
 
 Sampling tests check normalized light CDFs, analytic sphere and box irradiance, inside emitters, overlapping proposals, occlusion, mirrors, depth truncation, initial-world stratification and irregular dispatch batches.
 
-Reconstruction and allocation checks cover Metal OIDN image quality, refracted guides and Beer absorption, raw-image preservation, stale-result rejection, exact adaptive ray budgets, analytic world-mixture energy, photon normalization and denoised-error priorities. The current Apple M1 run passes 24 GPU checks in addition to the CPU suite.
+Reconstruction and allocation checks cover Metal OIDN image quality, refracted guides and Beer absorption, raw-image preservation, stale-result rejection, exact adaptive ray budgets, analytic world-mixture energy, photon normalization and denoised-error priorities. The original Apple M1 run passed 28 GPU checks. The M5 upgrade passes 38 GPU unit checks plus the separate transport integration test, in addition to the CPU suite; see [the acceleration report](docs/m5-acceleration.md).
 
 CPU tests also check deterministic BVH structure, containment, escape links, empty/plane-only worlds, coincident objects, and invalid input. CPU tests cover sphere and slab-box intersections (front hits, inside exits, tangents, parallel axes, boundary rays, non-unit sphere rays and self-offsets), deterministic scene generation, and invalidation behavior. CPU intersection references return geometric outward normals; the shader orients these against incoming rays for two-sided shading.
 
@@ -340,13 +389,17 @@ At `p=0.5`, mode 3/4 has expectation `p*a*e + (1-p)*E`. Mode 5 has expectation `
 ## Code map and performance
 
 - `src/main.rs`: CLI and bounded headless dispatch loop.
-- `src/app.rs`: egui controls, winit/eframe integration, shared-GPU texture presentation.
-- `src/gpu.rs`: buffers, compute pipelines, resource validation and explicit readback/export.
+- `src/app.rs` and `src/app/labs.rs`: separate workspace controls and session settings, winit/eframe integration, shared-GPU presentation.
+- `src/gpu.rs`: buffers, compute pipelines, bounded live submissions, resource validation and explicit readback/export.
+- `src/gpu/export.rs`: asynchronous interactive image readback and PNG writing.
 - `src/scene.rs`: world preset catalog, original deterministic scenes and integer PRNG.
 - `src/scene/presets.rs`: four procedural architectural, orbital and organic sets.
 - `src/bvh.rs`: deterministic surface-area BVH construction and flat GPU node layout.
 - `src/sampling.rs`: power-weighted light distributions and upload metadata.
 - `src/gpu/nrc.rs` and `src/shaders/nrc.wgsl`: optional fused online neural radiance cache.
+- `src/gpu/ray_query.rs`: device-gated native per-world acceleration and exact query acceptance.
+- `src/gpu/tensor.rs` and `src/shaders/tensor.metal`: M5 TensorOps inference for both neural caches.
+- `src/gpu/metal.rs`: owned native Metal/wgpu sharing boundary.
 - `examples/nrc_benchmark.rs` and `examples/export_nrc_metal.rs`: uncached-reference comparison and inspectable Metal export.
 - `examples/sampling_benchmark.rs`: raw error and completion-timed sampling comparisons.
 - `examples/combo_gallery.rs`: reproducible camera and transport recipes for the world-collision gallery.
@@ -359,8 +412,10 @@ At `p=0.5`, mode 3/4 has expectation `p*a*e + (1-p)*E`. Mode 5 has expectation `
 - `src/gpu/oidn.rs`, `src/gpu/oidn/native.rs` and `src/shaders/oidn.wgsl`: asynchronous Metal OIDN and reconstruction-error feedback.
 - `src/gpu/adaptive.rs` and `src/shaders/adaptive.wgsl`: GPU priority scans, compact ray queues and unbiased round accounting.
 - `examples/reconstruction_benchmark.rs`: reconstruction/allocation comparisons at equal elapsed time.
+- `src/shaders/caustics_sampling.wgsl`: learned light/caster proposals, analytic sphere manifold shooting and weighted light-path reservoirs.
+- `examples/caustics_benchmark.rs --advanced`: all eight method combinations against an independent camera reference.
 
-Each world owns a separate geometry/material/light buffer **and its own BVH buffer**. A deterministic surface-area split builder emits 32-byte nodes with one finite primitive per leaf. Depth-first escape links allow stackless traversal with no fixed GPU traversal-stack capacity. Bounds are padded outwards; the slab interval is conservative at grazing/parallel directions. Infinite planes stay outside finite bounds and are tested first. The original scene indices resolve equal-distance hits, so overlapping objects and planes keep the reference's tie convention.
+Each world owns a separate geometry/material/light buffer **and its own BVH buffer**, plus native acceleration structures when supported. The following describes the portable software query; [native ray-query details](docs/m5-acceleration.md) explain the accelerated path. A deterministic surface-area split builder emits 32-byte nodes with one finite primitive per leaf. Depth-first escape links allow stackless traversal with no fixed GPU traversal-stack capacity. Bounds are padded outwards; the slab interval is conservative at grazing/parallel directions. Infinite planes stay outside finite bounds and are tested first. The original scene indices resolve equal-distance hits, so overlapping objects and planes keep the reference's tie convention.
 
 Every ray segment starts a **fresh traversal of only its selected world**, including when its origin lies inside geometry in the other world. No previous world's node index, interval or hit is reused. Seed regeneration and custom `Renderer::set_worlds` replace geometry and acceleration together; empty worlds and scene sizes beyond the original 29 objects are supported. Invalid inputs leave both active worlds intact.
 
@@ -368,7 +423,7 @@ The automatic policy uses optimized linear distance queries for at most 32 finit
 
 Candidate queries compute only distances from geometry, with early slab rejection. Only the winner computes its full shading hit; box face ties use the reference normal routine. Six transport-specialized compute pipelines are created once at initialization. Denoiser-input variants are created once on first enable and then reused. Integer sample streams and light-transport math are unchanged by the acceleration work. Spatial mode intentionally changes the primary lookup convention as described above. Interactive accumulation also writes its final display pixel, eliminating a separate dispatch and buffer reread. Paused frames skip accumulation, and unchanged paused frames submit no compute work. Headless batches defer presentation until completion.
 
-There is no CPU path tracer or per-frame shader compilation. Camera tracing and adaptive scheduling stay on the GPU. OIDN uses a bounded background worker with asynchronous snapshot readback and reconstruction upload. Persistent radiance, guides, moments and scheduling records cost **320 bytes/pixel** (~146 MiB at 800×600), plus the display texture and separate neural, caustic and reconstruction resources. Resolution changes reallocate targets; ordinary frames reuse persistent resources. Headless jobs bound outstanding GPU work periodically.
+There is no CPU path tracer or per-frame shader compilation. Camera tracing and adaptive scheduling stay on the GPU. OIDN uses a bounded background worker with shared Metal snapshots and GPU reconstruction publication, with asynchronous host staging on other backends. Persistent radiance, guides, moments and scheduling records cost **320 bytes/pixel** (~146 MiB at 800×600), plus the display texture and separate neural, caustic and reconstruction resources. Resolution changes reallocate targets; ordinary frames reuse persistent resources. Headless jobs bound outstanding GPU work periodically.
 
 For construction background, see [PBRT's BVH chapter](https://pbr-book.org/4ed/Primitives_and_Intersection_Acceleration/Bounding_Volume_Hierarchies). The stackless layout and separate unbounded-plane prefix here are specific to this renderer.
 

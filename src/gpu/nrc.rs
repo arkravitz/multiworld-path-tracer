@@ -12,6 +12,7 @@ pub(super) const BYTES: u64 =
         + 256 * 64
         + 1024 * 16;
 pub(super) struct Neural {
+    pub tensor: Option<super::tensor::Cache>,
     pub initialized: bool,
     pub batches: u32,
 
@@ -34,6 +35,7 @@ impl Neural {
         base: &wgpu::BindGroupLayout,
         width: u32,
         height: u32,
+        trace_group_y: u32,
     ) -> Self {
         let cooperative = device
             .features()
@@ -68,30 +70,43 @@ impl Neural {
             bind_group_layouts: &[Some(base), Some(&query_layout)],
             immediate_size: 0,
         });
+        let matrix_source = super::ray_query::shader(
+            device,
+            format!(
+                "enable wgpu_cooperative_matrix;\n{}\n{}\n{}\n{}\n{}",
+                concat!(
+                    concat!(
+                        include_str!("../shaders/trace.wgsl"),
+                        "\n",
+                        include_str!("../shaders/adaptive.wgsl")
+                    ),
+                    "\n",
+                    include_str!("../shaders/caustics_stub.wgsl")
+                ),
+                include_str!("../shaders/nrc.wgsl"),
+                include_str!("../shaders/nrc_matrix.wgsl"),
+                include_str!("../shaders/nrc_queued.wgsl"),
+                include_str!("../shaders/denoise.wgsl")
+            ),
+        );
         let matrix_shader = cooperative.then(|| {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Metal cooperative neural matrices"),
-                source: wgpu::ShaderSource::Wgsl(
-                    format!(
-                        "enable wgpu_cooperative_matrix;\n{}\n{}\n{}\n{}\n{}",
-                        concat!(
-                            concat!(
-                                include_str!("../shaders/trace.wgsl"),
-                                "\n",
-                                include_str!("../shaders/adaptive.wgsl")
-                            ),
-                            "\n",
-                            include_str!("../shaders/caustics_stub.wgsl")
-                        ),
-                        include_str!("../shaders/nrc.wgsl"),
-                        include_str!("../shaders/nrc_matrix.wgsl"),
-                        include_str!("../shaders/nrc_queued.wgsl"),
-                        include_str!("../shaders/denoise.wgsl")
-                    )
-                    .into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(matrix_source.clone().into()),
             })
         });
+        let tensor = if cooperative {
+            super::tensor::Cache::new(
+                device,
+                base,
+                &query_layout,
+                width * height,
+                32,
+                matrix_source,
+            )
+        } else {
+            None
+        };
         let pipeline = |entry: &'static str, mode: u32, guides: bool| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
@@ -123,7 +138,7 @@ impl Neural {
                             u32::from(cooperative && entry == "neural_teach") as f64,
                         ),
                         ("NRC_COOPERATIVE", 0.),
-                        ("TRACE_GROUP_Y", 8.),
+                        ("TRACE_GROUP_Y", trace_group_y as f64),
                         ("ACTIVE_MODE", mode as f64),
                         ("DENOISE_INPUT", u32::from(guides) as f64),
                     ],
@@ -135,6 +150,7 @@ impl Neural {
             })
         };
         Self {
+            tensor,
             resolve: cooperative.then(|| {
                 std::array::from_fn(|m| pipeline("neural_resolve_queries", m as u32, false))
             }),
@@ -164,20 +180,34 @@ impl Neural {
         encoder: &mut wgpu::CommandEncoder,
         group: &wgpu::BindGroup,
         mode: usize,
-        width: u32,
-        height: u32,
+        size: [u32; 2],
         guides: bool,
+        use_tensor: bool,
     ) {
+        let [width, height] = size;
+        if use_tensor && let Some(tensor) = &self.tensor {
+            tensor.run(
+                encoder,
+                group,
+                &self.queries,
+                width * height * if mode == 2 { 2 } else { 1 },
+            );
+            if guides {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.finish_guides.as_ref().unwrap()[mode]);
+                pass.set_bind_group(0, group, &[]);
+                pass.set_bind_group(1, &self.queries, &[]);
+                pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+            }
+            return;
+        }
         if let Some(pipelines) = &self.resolve {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipelines[mode]);
             pass.set_bind_group(0, group, &[]);
             pass.set_bind_group(1, &self.queries, &[]);
-            pass.dispatch_workgroups(
-                (width * height * if mode == 2 { 2 } else { 1 }).div_ceil(32),
-                1,
-                1,
-            );
+            let groups = (width * height * if mode == 2 { 2 } else { 1 }).div_ceil(32);
+            pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
             if guides {
                 pass.set_pipeline(&self.finish_guides.as_ref().unwrap()[mode]);
                 pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);

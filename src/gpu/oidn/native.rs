@@ -41,6 +41,8 @@ mod symbols {
         oidnSetFilterInt: (Handle, *const c_char, i32) -> (),
         oidnCommitFilter: (Handle) -> (),
         oidnExecuteFilter: (Handle) -> (),
+        oidnExecuteFilterAsync: (Handle) -> (),
+        oidnSyncDevice: (Handle) -> (),
     }
     pub struct Engine {
         api: Api,
@@ -50,7 +52,11 @@ mod symbols {
         size: [u32; 2],
     }
     impl Engine {
+        #[cfg(test)]
         pub fn new() -> Result<Self> {
+            Self::new_on_queue(None)
+        }
+        pub fn new_on_queue(queue: Option<*mut c_void>) -> Result<Self> {
             let mut paths = Vec::new();
             if let Some(path) = std::env::var_os("OIDN_LIBRARY_PATH") {
                 paths.push(PathBuf::from(path));
@@ -86,8 +92,13 @@ mod symbols {
                     .context("OIDN 2 runtime has an incompatible ABI")?;
                 // Select Metal explicitly on macOS: do not silently claim GPU
                 // denoising after falling back to the CPU.
-                let device =
-                    unsafe { (api.oidnNewDevice)(if cfg!(target_os = "macos") { 5 } else { 0 }) };
+                let device = if let Some(queue) = queue {
+                    type NewMetal = unsafe extern "C" fn(*const *mut c_void, i32) -> Handle;
+                    let create = unsafe { api._library.get::<NewMetal>(b"oidnNewMetalDevice\0") }?;
+                    unsafe { create(&queue, 1) }
+                } else {
+                    unsafe { (api.oidnNewDevice)(if cfg!(target_os = "macos") { 5 } else { 0 }) }
+                };
                 let engine = Self {
                     api,
                     device,
@@ -196,6 +207,94 @@ mod symbols {
                 }
             }
             self.size = size;
+            Ok(())
+        }
+        /// The caller owns the imported Metal storage until all filters and
+        /// this device are released. A job starts after wgpu completion and this
+        /// synchronous call finishes before its results are published to wgpu.
+        pub fn reconstruct_shared(
+            &mut self,
+            size: [u32; 2],
+            buffer: *mut c_void,
+            blend: bool,
+            uncertainty: bool,
+        ) -> Result<()> {
+            if self.size != size {
+                self.clear_images();
+                type Import = unsafe extern "C" fn(Handle, *mut c_void) -> Handle;
+                let import = unsafe {
+                    self.api
+                        ._library
+                        .get::<Import>(b"oidnNewSharedBufferFromMetal\0")
+                }?;
+                let shared = unsafe { import(self.device, buffer) };
+                self.check()?;
+                ensure!(!shared.is_null(), "OIDN could not import Metal storage");
+                self.buffers.push(shared);
+                let stride = size_of::<super::super::Input>();
+                let result_base = size[0] as usize * size[1] as usize * stride;
+                for world in 0..2 {
+                    for kind in 0..5 {
+                        let filter =
+                            unsafe { (self.api.oidnNewFilter)(self.device, c"RT".as_ptr()) };
+                        self.check()?;
+                        ensure!(!filter.is_null(), "OIDN shared filter allocation failed");
+                        self.filters.push(filter);
+                        let image = |name: &CStr, offset: usize| unsafe {
+                            (self.api.oidnSetFilterImage)(
+                                filter,
+                                name.as_ptr(),
+                                shared,
+                                3,
+                                size[0] as usize,
+                                size[1] as usize,
+                                offset,
+                                stride,
+                                0,
+                            )
+                        };
+                        let base = world * 48;
+                        if kind < 3 {
+                            let color = if kind == 0 {
+                                base
+                            } else {
+                                96 + world * 32 + (kind - 1) * 16
+                            };
+                            image(c"color", color);
+                            image(c"normal", base + 16);
+                            image(c"albedo", base + 32);
+                            image(c"output", result_base + color);
+                            unsafe {
+                                (self.api.oidnSetFilterBool)(filter, c"hdr".as_ptr(), true);
+                                (self.api.oidnSetFilterBool)(filter, c"cleanAux".as_ptr(), true);
+                            }
+                        } else {
+                            let offset = base + if kind == 3 { 32 } else { 16 };
+                            image(if kind == 3 { c"albedo" } else { c"normal" }, offset);
+                            image(c"output", offset);
+                        }
+                        unsafe {
+                            (self.api.oidnSetFilterInt)(filter, c"quality".as_ptr(), 6);
+                            (self.api.oidnCommitFilter)(filter);
+                        }
+                        self.check()?;
+                    }
+                }
+                self.size = size;
+            }
+            for world in 0..if blend { 2 } else { 1 } {
+                for kind in
+                    [3, 4, 0]
+                        .into_iter()
+                        .chain(if uncertainty { vec![1, 2] } else { vec![] })
+                {
+                    unsafe { (self.api.oidnExecuteFilterAsync)(self.filters[world * 5 + kind]) };
+                    self.check()?;
+                }
+            }
+            // One worker-side completion boundary for the ordered Metal batch.
+            unsafe { (self.api.oidnSyncDevice)(self.device) };
+            self.check()?;
             Ok(())
         }
         #[cfg(test)]

@@ -1,0 +1,3 @@
+estimator,samples,seconds,linear_nrmse,floor_nrmse,linear_mean
+photon-guiding,78,8.017094,0.051260,0.265192,0.260287
+photon-nrc,72,8.063717,0.045979,0.200447,0.260401

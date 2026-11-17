@@ -31,6 +31,7 @@ pub(super) struct Feedback {
     pub raw_b: [f32; 4],
 }
 struct Job {
+    samples: u32,
     generation: u64,
     size: [u32; 2],
     blend: bool,
@@ -44,8 +45,10 @@ struct Output {
     image: Vec<Feedback>,
     milliseconds: f64,
     prior: bool,
+    shared: bool,
 }
 struct Pending {
+    samples: u32,
     buffer: wgpu::Buffer,
     mapped: bool,
     receive: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
@@ -69,6 +72,12 @@ pub(super) struct Oidn {
     pending: Option<Pending>,
     busy: bool,
     input: wgpu::Buffer,
+    shared: bool,
+    finalize: wgpu::ComputePipeline,
+    finalize_group: wgpu::BindGroup,
+    finalize_uniform: wgpu::Buffer,
+    snapshot_params: [u32; 8],
+    snapshot_group: Option<wgpu::BindGroup>,
     output: wgpu::Buffer,
     input_group: wgpu::BindGroup,
     output_group: wgpu::BindGroup,
@@ -113,7 +122,15 @@ impl Oidn {
                 mapped_at_creation: false,
             })
         };
-        let input = buffer("OIDN input packing", n * size_of::<Input>() as u64);
+        let shared = if std::env::var_os("MULTIWORLD_OIDN_STAGING").is_none() {
+            super::metal::SharedBuffer::new(device, n * size_of::<Input>() as u64 * 2).ok()
+        } else {
+            None
+        };
+        let input = shared.as_ref().map_or_else(
+            || buffer("OIDN input packing", n * size_of::<Input>() as u64),
+            |s| s.buffer.clone(),
+        );
         let output = buffer(
             "OIDN completed reconstruction",
             n * size_of::<Feedback>() as u64,
@@ -128,6 +145,38 @@ impl Oidn {
                 }],
             })
         };
+        let finalize_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("OIDN snapshot parameters"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let finalize_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shared OIDN publication"),
+            entries: &[
+                super::buffer_entry(4, wgpu::BufferBindingType::Storage { read_only: false }),
+                super::buffer_entry(5, wgpu::BufferBindingType::Storage { read_only: false }),
+                super::buffer_entry(6, wgpu::BufferBindingType::Uniform),
+            ],
+        });
+        let finalize_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Shared OIDN publication"),
+            layout: &finalize_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: output.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: finalize_uniform.as_entire_binding(),
+                },
+            ],
+        });
         let input_group = group(&input, &input_layout, 4);
         let output_group = group(&output, &output_layout, 5);
         let pipeline = |entry: &'static str, extra: &wgpu::BindGroupLayout| {
@@ -147,19 +196,37 @@ impl Oidn {
         };
         let (jobs, work) = mpsc::sync_channel::<Job>(1);
         let (results, outputs) = mpsc::sync_channel(1);
+        let use_shared = shared.is_some();
         std::thread::Builder::new()
             .name("OIDN reconstruction".into())
             .spawn(move || {
-                let mut engine = match native::Engine::new() {
-                    Ok(e) => e,
-                    Err(e) => {
-                        let _ = results.send(Err(format!("{e:#}")));
-                        return;
-                    }
-                };
+                let mut engine =
+                    match native::Engine::new_on_queue(shared.as_ref().map(|s| s.native_queue())) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            let _ = results.send(Err(format!("{e:#}")));
+                            return;
+                        }
+                    };
                 while let Ok(job) = work.recv() {
                     let started = Instant::now();
                     let result = (|| -> Result<Output> {
+                        if let Some(shared) = &shared {
+                            engine.reconstruct_shared(
+                                job.size,
+                                shared.native_buffer(),
+                                job.blend,
+                                job.uncertainty,
+                            )?;
+                            return Ok(Output {
+                                generation: job.generation,
+                                samples: job.samples,
+                                image: Vec::new(),
+                                milliseconds: started.elapsed().as_secs_f64() * 1000.,
+                                prior: job.uncertainty,
+                                shared: true,
+                            });
+                        }
                         // Copy mapped data on this worker, not the UI thread.
                         let bytes = job.input.slice(..).get_mapped_range()?;
                         let input: Vec<Input> = bytes
@@ -226,6 +293,7 @@ impl Oidn {
                             image,
                             milliseconds: started.elapsed().as_secs_f64() * 1000.,
                             prior: job.uncertainty,
+                            shared: false,
                         })
                     })();
                     if results.send(result.map_err(|e| format!("{e:#}"))).is_err() {
@@ -240,6 +308,12 @@ impl Oidn {
             pending: None,
             busy: false,
             input,
+            shared: use_shared,
+            finalize: pipeline("oidn_finalize", &finalize_layout),
+            finalize_group,
+            finalize_uniform,
+            snapshot_params: [0; 8],
+            snapshot_group: None,
             output,
             input_group,
             output_group,
@@ -276,6 +350,7 @@ impl Oidn {
                     if pending.generation == generation {
                         let job = Job {
                             generation,
+                            samples: pending.samples,
                             size: self.size,
                             blend: pending.blend,
                             input: pending.buffer,
@@ -288,13 +363,17 @@ impl Oidn {
                                 mpsc::TrySendError::Full(job)
                                 | mpsc::TrySendError::Disconnected(job),
                             ) => {
-                                job.input.unmap();
+                                if !self.shared {
+                                    job.input.unmap();
+                                }
                                 self.failed = true;
                                 self.status = "OIDN worker stopped".into();
                             }
                         }
                     } else {
-                        pending.buffer.unmap();
+                        if !self.shared {
+                            pending.buffer.unmap();
+                        }
                     }
                 }
                 Err(error) => {
@@ -307,12 +386,39 @@ impl Oidn {
             self.busy = false;
             match result {
                 Ok(output) if output.generation == generation => {
-                    queue.write_buffer(&self.output, 0, bytemuck::cast_slice(&output.image));
+                    if output.shared {
+                        queue.write_buffer(
+                            &self.finalize_uniform,
+                            0,
+                            bytemuck::cast_slice(&self.snapshot_params),
+                        );
+                        let mut encoder = device.create_command_encoder(&Default::default());
+                        {
+                            let mut pass = encoder.begin_compute_pass(&Default::default());
+                            pass.set_pipeline(&self.finalize);
+                            pass.set_bind_group(0, self.snapshot_group.as_ref().unwrap(), &[]);
+                            pass.set_bind_group(1, &self.finalize_group, &[]);
+                            pass.dispatch_workgroups(
+                                self.size[0].div_ceil(8),
+                                self.size[1].div_ceil(8),
+                                1,
+                            );
+                        }
+                        queue.submit([encoder.finish()]);
+                    } else {
+                        queue.write_buffer(&self.output, 0, bytemuck::cast_slice(&output.image));
+                    }
                     self.completed = output.samples;
                     self.feedback_dirty |= output.prior;
                     self.status = format!(
-                        "OIDN / Metal · {} spp · {:.0} ms",
-                        output.samples, output.milliseconds
+                        "OIDN / Metal · {} · {} spp · {:.0} ms",
+                        if self.shared {
+                            "shared buffers"
+                        } else {
+                            "staged"
+                        },
+                        output.samples,
+                        output.milliseconds
                     );
                 }
                 Ok(_) => {}
@@ -360,15 +466,33 @@ impl Oidn {
             pass.set_bind_group(1, &self.input_group, &[]);
             pass.dispatch_workgroups(self.size[0].div_ceil(8), self.size[1].div_ceil(8), 1);
         }
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Asynchronous OIDN readback"),
-            size: self.input.size(),
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        encoder.copy_buffer_to_buffer(&self.input, 0, &buffer, 0, self.input.size());
+        self.snapshot_group = Some(base.clone());
+        self.snapshot_params = [
+            self.size[0],
+            self.size[1],
+            u32::from(blend),
+            u32::from(uncertainty),
+            strength.to_bits(),
+            0,
+            0,
+            0,
+        ];
+        let buffer = if self.shared {
+            self.input.clone()
+        } else {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Asynchronous OIDN readback"),
+                size: self.input.size(),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        if !self.shared {
+            encoder.copy_buffer_to_buffer(&self.input, 0, &buffer, 0, self.input.size());
+        }
         let (send, receive) = mpsc::sync_channel(1);
         self.pending = Some(Pending {
+            samples,
             buffer,
             mapped: false,
             receive,
@@ -384,14 +508,20 @@ impl Oidn {
             self.last_prior = Instant::now();
         }
     }
-    pub fn after_submit(&mut self) {
+    pub fn after_submit(&mut self, queue: &wgpu::Queue) {
         if let Some(p) = &mut self.pending
             && !p.mapped
         {
             let send = p.send.take().unwrap();
-            p.buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                let _ = send.send(r);
-            });
+            if self.shared {
+                queue.on_submitted_work_done(move || {
+                    let _ = send.send(Ok(()));
+                });
+            } else {
+                p.buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = send.send(r);
+                });
+            }
             p.mapped = true;
         }
     }
@@ -425,11 +555,93 @@ impl Oidn {
     pub fn has_image(&self) -> bool {
         self.completed > 0
     }
+    pub fn has_pending_work(&self) -> bool {
+        self.busy || self.pending.is_some()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires installed OIDN runtime and Metal GPU"]
+    fn shared_metal_oidn_matches_staging_for_both_worlds_and_halves() {
+        let (device, queue) = pollster::block_on(super::super::headless_device()).unwrap();
+        let r = super::super::Renderer::new(device, queue, 32, 24, 42).unwrap();
+        let size = [32, 24];
+        let n = (size[0] * size[1]) as usize;
+        let mut input = vec![Input::zeroed(); n];
+        for (i, p) in input.iter_mut().enumerate() {
+            let noise = ((i * 7919 % 101) as f32 / 100. - 0.5) * 0.2;
+            let c = if i % 32 < 16 { 0.01 } else { 1.2 };
+            p.color_a = [c + noise, 0.3, 0.7, 32.];
+            p.color_b = [0.5, c + noise, 0.2, 32.];
+            p.normal_a = [0., 1., 0., 0.];
+            p.normal_b = p.normal_a;
+            p.albedo_a = [c.min(1.), 0.3, 0.7, 0.];
+            p.albedo_b = [0.5, c.min(1.), 0.2, 0.];
+            p.half_a0 = [c + noise, 0.3, 0.7, 16.];
+            p.half_a1 = [c - noise, 0.3, 0.7, 16.];
+            p.half_b0 = [0.5, c + noise, 0.2, 16.];
+            p.half_b1 = [0.5, c - noise, 0.2, 16.];
+        }
+        let bytes = std::mem::size_of_val(input.as_slice()) as u64;
+        let shared = super::super::metal::SharedBuffer::new(&r.device, bytes * 2).unwrap();
+        r.queue
+            .write_buffer(&shared.buffer, 0, bytemuck::cast_slice(&input));
+        r.queue.submit([]);
+        r.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(60)),
+            })
+            .unwrap();
+        let mut native = native::Engine::new_on_queue(Some(shared.native_queue())).unwrap();
+        native
+            .reconstruct_shared(size, shared.native_buffer(), true, true)
+            .unwrap();
+        let stage = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shared OIDN equivalence readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = r.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&shared.buffer, bytes, &stage, 0, bytes);
+        let result = r.read_buffer(encoder, &stage).unwrap();
+        let result: Vec<Input> = result
+            .as_chunks::<{ size_of::<Input>() }>()
+            .0
+            .iter()
+            .map(|p| bytemuck::pod_read_unaligned(p))
+            .collect();
+        let mut staged = native::Engine::new().unwrap();
+        let mut max_error = 0_f32;
+        for world in 0..2 {
+            let expected = staged.reconstruct(size, &input, world, true).unwrap();
+            for (i, p) in result.iter().enumerate() {
+                let actual = if world == 0 {
+                    [p.color_a, p.half_a0, p.half_a1]
+                } else {
+                    [p.color_b, p.half_b0, p.half_b1]
+                };
+                for (a, b) in actual.iter().zip([
+                    expected.color[i],
+                    expected.halves.as_ref().unwrap()[0][i],
+                    expected.halves.as_ref().unwrap()[1][i],
+                ]) {
+                    for c in 0..3 {
+                        max_error = max_error.max((a[c] - b[c]).abs());
+                    }
+                }
+            }
+        }
+        eprintln!("Shared/staged OIDN maximum RGB error: {max_error}");
+        assert!(
+            max_error < 1e-4,
+            "Shared Metal reconstruction differs from staged reconstruction"
+        );
+    }
     #[test]
     fn oidn_shader_and_pixel_abi_validate() {
         assert_eq!(size_of::<Input>(), 160);

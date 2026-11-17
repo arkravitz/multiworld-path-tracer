@@ -66,3 +66,27 @@ PNG succeeded in the user-owned Pictures capture directory. Native UI checks
 also confirmed the 0.2.0 version label, temporal-denoising toggle/strength,
 updated image and raw/display export controls. Public gallery assets are GPU
 render captures, not desktop screenshots containing filesystem status text.
+
+
+## M5 acceleration verification · 16 November 2026
+
+The M5 Max run passed 38 GPU unit checks plus the separate GPU transport
+integration test using `cargo test --release -- --ignored --nocapture --test-threads=1 --skip neural_gpu_phase_profile`. The diagnostic phase profiler
+is excluded deliberately; the functional suite includes native ray-query
+comparison (965,340 direct probe comparisons), both neural backends, direct
+shared/staged OIDN equivalence, feature-disabled devices, alternate workgroups,
+and the deterministic large-image adaptive-budget regression.
+
+`cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
+and `git diff --check` also passed. A 1056×1024 blended-image SIMD-cache smoke
+render verified the two-dimensional fallback query dispatch. The local app
+executable was replaced atomically and the bundle's code signature verified.
+See [the implementation and benchmark report](docs/m5-acceleration.md) for
+measurement scope and reproducible commands. Generated verification logs remain
+in ignored `output/m5-final-*-tests.log`.
+
+
+The packaged executable also passed two automatic native-window startup/export
+smoke tests: Multiworld with the camera neural cache, and the glass workspace
+with photon NRC, OIDN and 20 bounces. Both exited successfully. The glass capture
+is kept in ignored `output/m5-packaged-app-smoke.png`.

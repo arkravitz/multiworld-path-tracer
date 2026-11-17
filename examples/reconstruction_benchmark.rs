@@ -208,7 +208,12 @@ fn main() -> Result<()> {
         let total: u64 = counts.iter().map(|p| u64::from(p.counts[0])).sum();
         ensure!(
             total == u64::from(args.width) * u64::from(args.height) * u64::from(r.samples),
-            "Camera ray budget was not preserved"
+            "Camera ray budget was not preserved: actual {total}, expected {}, spp {}, min {}, max {}, guards {}",
+            u64::from(args.width) * u64::from(args.height) * u64::from(r.samples),
+            r.samples,
+            counts.iter().map(|p| p.counts[0]).min().unwrap_or(0),
+            counts.iter().map(|p| p.counts[0]).max().unwrap_or(0),
+            counts.iter().map(|p| u64::from(p.counts[2])).sum::<u64>()
         );
         ensure!(
             counts.iter().all(|p| p.counts[2] == 0),

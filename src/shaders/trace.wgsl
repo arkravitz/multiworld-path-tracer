@@ -1,10 +1,12 @@
 override DENOISE_INPUT: bool = false;
+override HARDWARE_QUERIES:bool=true;
 override ACTIVE_MODE: u32 = 4u;
 override ADAPTIVE_TRACE:bool=false;
+override PHOTON_NRC_ENABLED:bool=false;
 struct Params {
     size: vec4<u32>, // width, height, samples this dispatch, previous samples
     transport: vec4<u32>, // mode, max depth, seed, debug view
-    controls: vec4<f32>, // p, persistence, exposure stops, query/display bitmask (1/2 BVH worlds, 4 fast linear, 8 fused display)
+    controls: vec4<f32>, // p, persistence, exposure stops, query/display bitmask (1/2 BVH worlds, 4 fast linear, 8 fused display, 16/32 native queries A/B)
     flags: vec4<u32>, // spatial probability, primary A, world A count, world B count
     acceleration: vec4<u32>, // node counts A/B, unbounded plane counts A/B
     lights: vec4<u32>, // finite light counts A/B, MIS enabled, worlds with glass bitmask
@@ -305,6 +307,7 @@ fn intersect_linear_fast(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
     return Hit(1e30,vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0),0.0,0.0,0.0);
 }
 fn intersect(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
+    if HARDWARE_QUERIES && (u32(params.controls.w)&(16u<<world))!=0u {return intersect_hardware(world,ro,rd,false);}
     if (u32(params.controls.w) & (1u << world)) != 0u { return intersect_bvh(world,ro,rd); }
     if (u32(params.controls.w) & 4u) != 0u { return intersect_linear_fast(world,ro,rd); }
     return intersect_brute(world,ro,rd);
@@ -313,6 +316,10 @@ fn intersect(world: u32, ro: vec3<f32>, rd: vec3<f32>) -> Hit {
 // and after a world switch. Closed, non-overlapping solids have an exit as their
 // nearest boundary when the ray origin is inside their volume.
 fn glass_boundary(world:u32,ro:vec3<f32>,rd:vec3<f32>)->Hit {
+    if HARDWARE_QUERIES && (u32(params.controls.w)&(16u<<world))!=0u {return intersect_hardware(world,ro,rd,true);}
+    return glass_boundary_software(world,ro,rd);
+}
+fn glass_boundary_software(world:u32,ro:vec3<f32>,rd:vec3<f32>)->Hit {
     var nearest=1e30;var nearest_id=0xffffffffu;
     if (u32(params.controls.w)&(1u<<world))!=0u {
         let count=select(params.acceleration.x,params.acceleration.y,world==1u);
@@ -382,6 +389,7 @@ fn oriented_direction(n: vec3<f32>, cos_theta: f32, phi: f32) -> vec3<f32> {
 }
 // Early-channel visibility, bounded at the sampled light. No shading for occluders.
 fn shadow_occluded(world: u32, ro: vec3<f32>, rd: vec3<f32>, limit: f32) -> bool {
+    if HARDWARE_QUERIES && (u32(params.controls.w)&(16u<<world))!=0u {return intersect_hardware(world,ro,rd,false).t<limit;}
     if (u32(params.controls.w) & (1u << world)) == 0u {
         let count = select(params.flags.z,params.flags.w,world==1u);
         for (var i=0u; i<count; i++) {
@@ -487,6 +495,7 @@ fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
     var guide_normal=vec3<f32>(0.0);var guide_albedo=vec3<f32>(1.0);var guide_weight=vec3<f32>(1.0);var guide_found=false;var guide_only=false;
     var previous_pdf = 0.0;
     var caustic_receiver=false;var caustic_chain=false;
+    var photon_query_captured=false;
     let switching = mode >= 4u && (params.flags.x != 0u || (params.controls.x > 0.0 && params.controls.x < 1.0)) && (mode != 5u || params.controls.y < 1.0);
     let directional_mis = params.lights.z != 0u && switching;
     var rng = seed; var selection_rng = hash(seed ^ 0xa511e9b3u);
@@ -560,6 +569,23 @@ fn trace(ro_in: vec3<f32>, rd_in: vec3<f32>, seed: u32, mode: u32) -> Result {
             radiance+=throughput*caustic_estimate(world,position,hit.normal,hit.color,bounce,rd_in);
             caustic_receiver=true;caustic_chain=false;
         } else if CAUSTICS_ENABLED && hit.metal>0.5 && caustic_receiver {caustic_chain=true;}
+        if PHOTON_NRC_ENABLED && !photon_query_captured && hit.metal<=0.5 && bounce+1u<params.transport.y {
+            photon_query_captured=true;neural_pending=true;
+            neural_pending_sample=NeuralSample(vec4<f32>(position,f32(world)),vec4<f32>(hit.normal,f32(params.transport.y-bounce-1u)),vec4<f32>(hit.color,0.0),vec4<f32>(0.0));
+            neural_pending_scale=vec3<f32>(0.0);
+            if photon_nrc_ready() {
+                // Use the frozen cache as a control variate, not the sole
+                // source of diffuse lighting. E[N + B/p * (L-N)] = E[L].
+                // The independent coin leaves camera/BSDF samples unchanged.
+                var correction_rng=hash(seed^0x639a72d5u);
+                let correction_probability=0.5;
+                let correction=random(&correction_rng)<correction_probability;
+                neural_pending_scale=throughput*(hit.color+vec3<f32>(0.01));
+                if !correction {break;}
+                neural_pending_scale*=1.0-1.0/correction_probability;
+                throughput/=correction_probability;
+            }
+        }
         if NRC_ENABLED && hit.metal<=0.5 && bounce+1u<params.transport.y {
             let sample=NeuralSample(vec4<f32>(position+hit.normal*0.002,f32(world)),vec4<f32>(hit.normal,f32(params.transport.y-bounce-1u)),vec4<f32>(hit.color,0.0),vec4<f32>(0.0));
             let eligible=select(bounce>=params.neural.y,bounce>0u && path_spread*path_spread>0.01*camera_footprint,params.neural.y==0u);
@@ -810,3 +836,6 @@ fn present(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.size.x || id.y >= params.size.y { return; }
     display_pixel(id,pixels[id.y*params.size.x+id.x]);
 }
+
+// Replaced with the native implementation only on ray-query-capable devices.
+fn intersect_hardware(world:u32,ro:vec3<f32>,rd:vec3<f32>,glass_only:bool)->Hit {return intersect_bvh(world,ro,rd);}

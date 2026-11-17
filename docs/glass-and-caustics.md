@@ -1,10 +1,10 @@
 # Faceted glass, online meshes, and caustics
 
-Click **Glass & caustics showcase** in the Worlds panel. World A selects the tessellated Utah Teapot gallery; World B selects the Suzanne crystal garden. Both use real online triangle meshes, embedded in the app. Choose a glass type separately under either world's selector, then try fixed-world, image-blend, or stochastic transport modes.
+Open the **Glass & caustics** tab at the top of the sidebar. Scene A selects the tessellated Utah Teapot gallery; Scene B selects the Suzanne crystal garden. Both use real online triangle meshes, embedded in the app. Choose a glass type under the active scene selector, or choose a two-scene blend. For stochastic cross-world glass experiments, use the separate **Multiworld** workspace; fast photon caustics stay disabled there.
 
 The materials include clear glass, borosilicate, flint crystal, high-index diamond, amber, emerald, sapphire, and water-like glass. **Curated glass palette** retains the scene's individually selected materials; any other choice replaces its glass materials with the chosen optical preset. The IORs and RGB absorption colors are illustrative presets, not measured spectral datasets.
 
-The showcase button also enables fast caustics, OIDN and denoising-aware adaptive sampling. See [reconstruction and sampling](reconstruction-and-adaptive-sampling.md). Its camera uses yaw 0.6, pitch 0.55, distance 13, depth 20 and exposure +0.25 EV. Glass needs enough bounces to enter and exit multiple walls. Accumulation and the display denoiser are useful for clean images; raw export retains the unfiltered estimate.
+The glass workspace defaults to fast caustics with learned launches, OIDN and uniform camera sampling, which won our short equal-time comparison. Adaptive modes remain selectable. See [reconstruction and sampling](reconstruction-and-adaptive-sampling.md). **Reset glass showcase** restores yaw 0.6, pitch 0.55, distance 13, depth 20 and exposure +0.25 EV. Glass needs enough bounces to enter and exit multiple walls. Accumulation and the display denoiser are useful for clean images; raw export retains the unfiltered estimate.
 
 ## What the renderer computes
 
@@ -42,3 +42,5 @@ Optical reference: [PBRT v4, Dielectric BSDF](https://pbr-book.org/4ed/Reflectio
 This raw capture uses 640×480, 1,024 spp, seed 42, depth 20, fixed World A, MIS enabled, no neural cache and no denoising. All glass in the teapot scene is replaced with the emerald preset. The README shows the curated clear-glass palette and the Suzanne crystal garden at the same camera and sample budget.
 
 The supplied meshes are embedded model data, not online dependencies at run time. The separate [asset attribution](../assets/README.md) identifies the original models and describes the changes made to prepare closed glass boundaries.
+
+The optional [advanced caustic methods](advanced-caustics.md) add analytic sphere manifold guiding, weighted light-path reservoir reuse and an independent photon budget. Learned launch selection is enabled by default; the two other experiments remain off after equal-time testing.
